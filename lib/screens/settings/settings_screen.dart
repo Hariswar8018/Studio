@@ -3,6 +3,7 @@ import 'package:google_fonts/google_fonts.dart';
 import 'package:provider/provider.dart';
 import '../../services/auth_service.dart';
 import '../../services/database_service.dart';
+import '../../services/analytics_service.dart';
 import '../../services/iap_service.dart';
 import '../../services/theme_service.dart';
 import '../../services/tts_service.dart';
@@ -10,7 +11,7 @@ import '../../widgets/app_native_ad_widget.dart';
 import '../../widgets/app_recommend_widget.dart';
 import '../../widgets/premium_subscription_dialog.dart';
 import '../admin/admin_upload_screen.dart';
-import '../onboarding/app_info_onboarding_screen.dart';
+import '../auth/login_screen.dart';
 import '../progress/grammar_metrics_screen.dart';
 
 class SettingsScreen extends StatelessWidget {
@@ -508,11 +509,11 @@ class SettingsScreen extends StatelessWidget {
                   child: const Icon(Icons.admin_panel_settings_rounded, color: Color(0xFFEF4444), size: 22),
                 ),
                 title: Text(
-                  'Admin JSON Studio',
+                  'Admin JSON Studio & File Upload',
                   style: GoogleFonts.fredoka(fontWeight: FontWeight.bold, color: textColor),
                 ),
                 subtitle: Text(
-                  'Upload, edit & validate Grammar, Vocab and Kanji JSON content',
+                  'Upload JSON files directly for Grammar, Kanji & Vocab, or edit live schema',
                   style: GoogleFonts.fredoka(fontSize: 12, color: subtextColor),
                 ),
                 trailing: const Icon(Icons.chevron_right_rounded, color: Colors.grey),
@@ -597,13 +598,18 @@ class SettingsScreen extends StatelessWidget {
                   ),
                 );
 
+                if (!context.mounted) return;
                 if (confirm == true) {
-                  await db.setOnboardingCompleted(false);
+                  try {
+                    final analytics = Provider.of<AnalyticsService>(context, listen: false);
+                    analytics.logEvent('logout');
+                    analytics.setUserId(null);
+                  } catch (_) {}
                   await auth.signOut();
                   if (context.mounted) {
                     Navigator.pushAndRemoveUntil(
                       context,
-                      MaterialPageRoute(builder: (_) => const AppInfoOnboardingScreen()),
+                      MaterialPageRoute(builder: (_) => const LoginScreen()),
                       (r) => false,
                     );
                   }

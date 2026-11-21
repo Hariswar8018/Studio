@@ -12,6 +12,8 @@ import 'services/auth_service.dart';
 import 'services/ad_service.dart';
 import 'services/iap_service.dart';
 import 'services/database_service.dart';
+import 'services/notification_service.dart';
+import 'services/analytics_service.dart';
 import 'services/theme_service.dart';
 import 'services/tts_service.dart';
 
@@ -48,6 +50,11 @@ void main() async {
     useFirebase: useFirebase,
     authService: authService,
   );
+  final analyticsService = AnalyticsService(useFirebase: useFirebase);
+
+  // Initialize FCM notifications asynchronously
+  final notificationService = NotificationService.instance;
+  notificationService.initialize(useFirebase: useFirebase);
 
   runApp(
     MultiProvider(
@@ -58,6 +65,8 @@ void main() async {
         ChangeNotifierProvider.value(value: authService),
         ChangeNotifierProvider.value(value: adService),
         ChangeNotifierProvider.value(value: iapService),
+        ChangeNotifierProvider.value(value: notificationService),
+        ChangeNotifierProvider.value(value: analyticsService),
       ],
       child: const GrammarApp(),
     ),
@@ -70,6 +79,7 @@ class GrammarApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final themeService = Provider.of<ThemeService>(context);
+    final analyticsService = Provider.of<AnalyticsService>(context, listen: false);
 
     final lightTheme = ThemeData(
       useMaterial3: true,
@@ -101,6 +111,9 @@ class GrammarApp extends StatelessWidget {
       theme: lightTheme,
       darkTheme: darkTheme,
       themeMode: themeService.themeMode,
+      navigatorObservers: analyticsService.observer != null
+          ? [analyticsService.observer!]
+          : const <NavigatorObserver>[],
       home: const SplashScreen(),
     );
   }

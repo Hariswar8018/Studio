@@ -3,6 +3,7 @@ import 'package:google_fonts/google_fonts.dart';
 import 'package:provider/provider.dart';
 import '../../services/auth_service.dart';
 import '../../services/database_service.dart';
+import '../../services/analytics_service.dart';
 import '../auth/login_screen.dart';
 import '../home/home_screen.dart';
 
@@ -55,11 +56,17 @@ class _JlptLevelSelectionScreenState extends State<JlptLevelSelectionScreen> {
     });
 
     final db = Provider.of<DatabaseService>(context, listen: false);
+    final analytics = Provider.of<AnalyticsService>(context, listen: false);
+    final auth = Provider.of<AuthService>(context, listen: false);
     await db.setSelectedLevel(level);
     await db.setOnboardingCompleted(true);
 
+    try {
+      analytics.logLevelSelected(level: level);
+      analytics.logEvent('onboarding_level_selected', parameters: {'level': level});
+    } catch (_) {}
+
     if (mounted) {
-      final auth = Provider.of<AuthService>(context, listen: false);
       final nextWidget = auth.currentUser != null ? const HomeScreen() : const LoginScreen();
       Navigator.of(context).pushReplacement(
         PageRouteBuilder(

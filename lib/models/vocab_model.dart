@@ -58,22 +58,70 @@ class VocabularyQuestion {
 
   factory VocabularyQuestion.fromMap(Map<String, dynamic> map) {
     final opts = <String, String>{};
-    if (map['options'] is Map) {
-      (map['options'] as Map).forEach((k, v) {
+    final rawOptions = map['options'] ?? map['choices'] ?? map['answers'];
+    if (rawOptions is Map) {
+      rawOptions.forEach((k, v) {
         opts[k.toString()] = v?.toString() ?? '';
       });
+    } else if (rawOptions is List) {
+      final labels = ['A', 'B', 'C', 'D', 'E', 'F'];
+      for (int i = 0; i < rawOptions.length; i++) {
+        final key = i < labels.length ? labels[i] : (i + 1).toString();
+        opts[key] = rawOptions[i]?.toString() ?? '';
+      }
     }
+
+    final rawCorrect = map['correctOption'] ??
+        map['correct_option'] ??
+        map['correct'] ??
+        map['answer'] ??
+        map['correctAnswer'];
+
+    String resolvedCorrect = '';
+    if (rawCorrect is int) {
+      const labels = ['A', 'B', 'C', 'D', 'E', 'F'];
+      if (rawCorrect >= 0 && rawCorrect < labels.length) {
+        resolvedCorrect = labels[rawCorrect];
+      } else {
+        resolvedCorrect = rawCorrect.toString();
+      }
+    } else if (rawCorrect != null) {
+      final str = rawCorrect.toString().trim();
+      if (str == '0') {
+        resolvedCorrect = 'A';
+      } else if (str == '1' && !opts.containsKey('1') && opts.containsKey('A')) {
+        resolvedCorrect = 'A';
+      } else if (str == '2' && !opts.containsKey('2') && opts.containsKey('B')) {
+        resolvedCorrect = 'B';
+      } else if (str == '3' && !opts.containsKey('3') && opts.containsKey('C')) {
+        resolvedCorrect = 'C';
+      } else if (str == '4' && !opts.containsKey('4') && opts.containsKey('D')) {
+        resolvedCorrect = 'D';
+      } else if (!opts.containsKey(str)) {
+        for (final entry in opts.entries) {
+          if (entry.value.trim() == str) {
+            resolvedCorrect = entry.key;
+            break;
+          }
+        }
+        if (resolvedCorrect.isEmpty) resolvedCorrect = str;
+      } else {
+        resolvedCorrect = str;
+      }
+    }
+
+    final rawExp = map['explanation'] ?? map['explanation_text'] ?? map['detail'] ?? map['reason'];
 
     return VocabularyQuestion(
       id: map['id'] ?? 0,
       type: map['type']?.toString() ?? 'meaning',
-      japanese: map['japanese']?.toString() ?? '',
-      english: map['english']?.toString() ?? '',
+      japanese: map['japanese']?.toString() ?? map['sentence']?.toString() ?? map['jp']?.toString() ?? '',
+      english: map['english']?.toString() ?? map['translation']?.toString() ?? map['meaning']?.toString() ?? map['en']?.toString() ?? '',
       question: map['question']?.toString() ?? '',
       options: opts,
-      correctOption: map['correctOption']?.toString() ?? 'A',
-      completedSentence: map['completedSentence']?.toString() ?? '',
-      explanation: QuestionExplanation.fromMap(map['explanation']),
+      correctOption: resolvedCorrect.isNotEmpty ? resolvedCorrect : 'A',
+      completedSentence: map['completedSentence']?.toString() ?? map['completed_sentence']?.toString() ?? map['fullSentence']?.toString() ?? '',
+      explanation: QuestionExplanation.fromMap(rawExp),
     );
   }
 

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:provider/provider.dart';
 import '../services/iap_service.dart';
+import '../services/analytics_service.dart';
 import '../services/theme_service.dart';
 
 class PremiumSubscriptionDialog extends StatefulWidget {
@@ -21,6 +22,18 @@ class PremiumSubscriptionDialog extends StatefulWidget {
 class _PremiumSubscriptionDialogState extends State<PremiumSubscriptionDialog> {
   // 0: Monthly, 1: Yearly (Default / Best Value)
   int _selectedPlan = 1;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      try {
+        final analytics = Provider.of<AnalyticsService>(context, listen: false);
+        analytics.logPaywallViewed(source: 'premium_dialog');
+      } catch (_) {}
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -304,6 +317,11 @@ class _PremiumSubscriptionDialogState extends State<PremiumSubscriptionDialog> {
                   onPressed: iap.isLoading
                       ? null
                       : () async {
+                          final planName = _selectedPlan == 1 ? 'yearly' : 'monthly';
+                          try {
+                            final analytics = Provider.of<AnalyticsService>(context, listen: false);
+                            analytics.logEvent('subscription_checkout_started', parameters: {'plan': planName});
+                          } catch (_) {}
                           try {
                             if (_selectedPlan == 1) {
                               await iap.buyYearlySubscription();
@@ -311,6 +329,10 @@ class _PremiumSubscriptionDialogState extends State<PremiumSubscriptionDialog> {
                               await iap.buyMonthlySubscription();
                             }
                             if (context.mounted && iap.isPremium) {
+                              try {
+                                final analytics = Provider.of<AnalyticsService>(context, listen: false);
+                                analytics.logSubscriptionPurchased(planId: planName);
+                              } catch (_) {}
                               Navigator.pop(context);
                             }
                           } catch (e) {

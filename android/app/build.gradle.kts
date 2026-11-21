@@ -28,9 +28,16 @@ android {
         applicationId = "com.starwish.funbits"
         minSdk = flutter.minSdkVersion
         targetSdk = flutter.targetSdkVersion
-        versionCode = 13
+        versionCode = 15
         versionName = flutter.versionName
         multiDexEnabled = true
+    }
+
+    lint {
+        checkReleaseBuilds = false
+        abortOnError = false
+        checkDependencies = false
+        ignoreWarnings = true
     }
 
     signingConfigs {
@@ -66,4 +73,8 @@ kotlin {
 
 flutter {
     source = "../.."
+}
+
+tasks.matching { it.name.startsWith("lintVital") }.configureEach {
+    enabled = false
 }

@@ -2,24 +2,30 @@ import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:provider/provider.dart';
 import '../../models/grammar_model.dart';
+import '../../models/srs_progress_model.dart';
 import '../../services/database_service.dart';
 import '../../services/theme_service.dart';
 import '../../services/tts_service.dart';
 import '../../services/ad_service.dart';
+import '../../services/analytics_service.dart';
 import '../../services/iap_service.dart';
 import '../../widgets/grammar_japanese_sentence_widget.dart';
 import '../../widgets/app_native_ad_widget.dart';
+import '../../widgets/clipboard_helper.dart';
+import '../../widgets/question_report_dialog.dart';
 
 class SrsReviewScreen extends StatefulWidget {
   final String? level;
   final GrammarTopicModel? topic;
   final bool onlyDue;
+  final String category; // 'grammar', 'vocab', 'kanji'
 
   const SrsReviewScreen({
     super.key,
     this.level,
     this.topic,
     this.onlyDue = false,
+    this.category = 'grammar',
   });
 
   @override
@@ -27,7 +33,7 @@ class SrsReviewScreen extends StatefulWidget {
 }
 
 class _SrsReviewScreenState extends State<SrsReviewScreen> {
-  late List<_ReviewItem> _items = [];
+  late List<UnifiedReviewQuestion> _items = [];
   int _currentIndex = 0;
   String? _selectedOption;
   bool _isAnswerSubmitted = false;
@@ -38,40 +44,46 @@ class _SrsReviewScreenState extends State<SrsReviewScreen> {
   @override
   void initState() {
     super.initState();
-    _loadQuestions();
+    _loadQuestions(onlyDue: widget.onlyDue);
   }
 
-  void _loadQuestions() {
+  void _loadQuestions({bool onlyDue = true}) {
     final db = Provider.of<DatabaseService>(context, listen: false);
-    List<GrammarTopicModel> topicsToUse = [];
+    List<UnifiedReviewQuestion> list = [];
 
     if (widget.topic != null) {
-      topicsToUse = [widget.topic!];
-    } else if (widget.level != null) {
-      topicsToUse = db.getTopicsForLevel(widget.level!);
-    } else {
-      topicsToUse = db.topics;
-    }
-
-    final List<_ReviewItem> list = [];
-    for (final topic in topicsToUse) {
-      for (final q in topic.questions) {
-        final progress = db.getQuestionProgress(q.id);
-        if (widget.onlyDue) {
-          if (progress == null || progress.isDue) {
-            list.add(_ReviewItem(topic: topic, question: q));
-          }
-        } else {
-          list.add(_ReviewItem(topic: topic, question: q));
-        }
+      list = db.getUnifiedQuestions(topicId: widget.topic!.id, category: 'grammar');
+      if (onlyDue) {
+        list = list.where((q) {
+          final p = db.getQuestionProgress(q.id);
+          return p == null || p.isDue;
+        }).toList();
       }
+    } else if (onlyDue) {
+      list = db.getDueUnifiedQuestions(level: widget.level, category: widget.category);
+    } else {
+      list = db.getUnifiedQuestions(level: widget.level, category: widget.category);
     }
 
     // Shuffle questions to prevent positional bias
     list.shuffle();
 
+    try {
+      final analytics = Provider.of<AnalyticsService>(context, listen: false);
+      analytics.logSrsReviewStarted(
+        category: widget.category,
+        dueCount: list.length,
+        level: widget.level,
+      );
+    } catch (_) {}
+
     setState(() {
       _items = list;
+      _currentIndex = 0;
+      _selectedOption = null;
+      _isAnswerSubmitted = false;
+      _correctCount = 0;
+      _wrongCount = 0;
       _loading = false;
     });
   }
@@ -87,7 +99,7 @@ class _SrsReviewScreenState extends State<SrsReviewScreen> {
     if (_isAnswerSubmitted || _items.isEmpty) return;
 
     final item = _items[_currentIndex];
-    final isCorrect = (optionKey == item.question.correctOption);
+    final isCorrect = (optionKey == item.correctOption);
 
     setState(() {
       _selectedOption = optionKey;
@@ -100,20 +112,32 @@ class _SrsReviewScreenState extends State<SrsReviewScreen> {
     });
 
     final db = Provider.of<DatabaseService>(context, listen: false);
-    db.recordQuestionAttempt(item.question.id, isCorrect);
+    db.recordQuestionAttempt(item.id, isCorrect, category: item.category);
+
+    try {
+      final analytics = Provider.of<AnalyticsService>(context, listen: false);
+      analytics.logQuestionAnswered(
+        lessonId: item.topicId,
+        category: item.category,
+        questionIndex: _currentIndex,
+        questionId: item.id,
+        isCorrect: isCorrect,
+        selectedOption: optionKey,
+        correctOption: item.correctOption,
+      );
+    } catch (_) {}
 
     // Speak full sentence audio on correct or wrong
     try {
       final tts = Provider.of<TtsService>(context, listen: false);
-      String audioText = item.question.completedSentence.isNotEmpty
-          ? item.question.completedSentence
-          : item.question.japanese;
+      String audioText = item.completedSentence.isNotEmpty
+          ? item.completedSentence
+          : item.japanese;
       if (audioText.contains('___')) {
-        final effectiveOpts = item.question.getEffectiveOptions(item.topic.globalOptions);
-        final fill = effectiveOpts[item.question.correctOption.toString()] ?? '';
+        final fill = item.options[item.correctOption] ?? '';
         audioText = audioText.replaceAll('___', fill);
       }
-      tts.speak(audioText);
+      tts.speakJapanese(audioText);
     } catch (e) {
       debugPrint('TTS playback error: $e');
     }
@@ -130,10 +154,26 @@ class _SrsReviewScreenState extends State<SrsReviewScreen> {
       setState(() {
         _currentIndex++; // triggers summary
       });
+
+      try {
+        final analytics = Provider.of<AnalyticsService>(context, listen: false);
+        analytics.logSrsReviewCompleted(
+          category: widget.category,
+          correctCount: _correctCount,
+          totalCount: _items.length,
+        );
+      } catch (_) {}
+
       final adService = Provider.of<AdService>(context, listen: false);
       final iap = Provider.of<IapService>(context, listen: false);
       adService.showRewardedAdAfterTest(isPremium: iap.isPremium);
     }
+  }
+
+  String _getCategoryDisplayName() {
+    if (widget.category == 'vocab') return 'Vocab';
+    if (widget.category == 'kanji') return 'Kanji';
+    return 'Grammar';
   }
 
   @override
@@ -148,9 +188,10 @@ class _SrsReviewScreenState extends State<SrsReviewScreen> {
     final textColor = isDark ? Colors.white : const Color(0xFF0F172A);
     final subtextColor = isDark ? Colors.white70 : const Color(0xFF64748B);
 
+    final catName = _getCategoryDisplayName();
     final title = widget.topic != null
         ? widget.topic!.title
-        : (widget.level != null ? '${widget.level} SRS Review' : 'Global SRS Review');
+        : (widget.level != null ? '${widget.level} $catName SRS Review' : 'Global $catName SRS Review');
 
     return Scaffold(
       backgroundColor: bgColor,
@@ -240,6 +281,7 @@ class _SrsReviewScreenState extends State<SrsReviewScreen> {
   }
 
   Widget _buildEmptyView(Color textColor, Color subtextColor) {
+    final catName = _getCategoryDisplayName();
     return Center(
       child: Padding(
         padding: const EdgeInsets.all(24),
@@ -249,12 +291,12 @@ class _SrsReviewScreenState extends State<SrsReviewScreen> {
             const Icon(Icons.verified_rounded, size: 64, color: Color(0xFF10B981)),
             const SizedBox(height: 14),
             Text(
-              'No Questions Due for Review!',
+              'No $catName Due for Review!',
               style: GoogleFonts.fredoka(fontSize: 18, fontWeight: FontWeight.bold, color: textColor),
             ),
             const SizedBox(height: 8),
             Text(
-              'You have reviewed all scheduled items. You can still practice all questions anytime by starting a non-due quiz.',
+              'You have reviewed all scheduled $catName items. You can still practice all questions anytime by starting a non-due review session.',
               textAlign: TextAlign.center,
               style: GoogleFonts.fredoka(fontSize: 13, color: subtextColor),
             ),
@@ -266,11 +308,9 @@ class _SrsReviewScreenState extends State<SrsReviewScreen> {
                 shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
               ),
               onPressed: () {
-                setState(() {
-                  _loadQuestions();
-                });
+                _loadQuestions(onlyDue: false);
               },
-              child: Text('Review All Questions', style: GoogleFonts.fredoka(fontWeight: FontWeight.bold)),
+              child: Text('Review All $catName Questions', style: GoogleFonts.fredoka(fontWeight: FontWeight.bold)),
             ),
           ],
         ),
@@ -288,9 +328,7 @@ class _SrsReviewScreenState extends State<SrsReviewScreen> {
     ThemeService theme,
   ) {
     final item = _items[_currentIndex];
-    final question = item.question;
-    final topic = item.topic;
-    final progress = db.getQuestionProgress(question.id);
+    final progress = db.getQuestionProgress(item.id);
     final stage = progress?.stage ?? 0;
     final interval = progress?.intervalDays ?? 1;
 
@@ -320,7 +358,7 @@ class _SrsReviewScreenState extends State<SrsReviewScreen> {
                 ),
                 const SizedBox(width: 8),
                 Text(
-                  topic.jlpt,
+                  item.jlpt,
                   style: GoogleFonts.fredoka(
                     fontSize: 12,
                     fontWeight: FontWeight.bold,
@@ -365,7 +403,7 @@ class _SrsReviewScreenState extends State<SrsReviewScreen> {
               const SizedBox(width: 6),
               Expanded(
                 child: Text(
-                  '${topic.title} • ${topic.category}',
+                  '${item.topicTitle} • ${item.badgeText}',
                   style: GoogleFonts.fredoka(
                     fontSize: 12,
                     fontWeight: FontWeight.w600,
@@ -402,29 +440,75 @@ class _SrsReviewScreenState extends State<SrsReviewScreen> {
               Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
-                  Text(
-                    'Select the most natural grammar expression:',
-                    style: GoogleFonts.fredoka(
-                      fontSize: 12,
-                      fontWeight: FontWeight.bold,
-                      color: subtextColor,
+                  Expanded(
+                    child: Text(
+                      item.questionText.isNotEmpty
+                          ? item.questionText
+                          : 'Select the most natural option:',
+                      style: GoogleFonts.fredoka(
+                        fontSize: 12,
+                        fontWeight: FontWeight.bold,
+                        color: subtextColor,
+                      ),
                     ),
                   ),
-                  IconButton(
-                    icon: const Icon(Icons.volume_up_rounded, color: Color(0xFF6366F1)),
-                    tooltip: 'Listen to sentence',
-                    onPressed: () {
-                      final textToSpeak = _isAnswerSubmitted
-                          ? question.completedSentence
-                          : question.japanese.replaceAll('___', '');
-                      tts.speakJapanese(textToSpeak);
-                    },
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      IconButton(
+                        icon: const Icon(Icons.flag_outlined, color: Color(0xFFEF4444), size: 20),
+                        tooltip: 'Report question mistake',
+                        onPressed: () {
+                          QuestionReportDialog.show(
+                            context: context,
+                            questionId: item.id,
+                            topicId: item.topicId,
+                            category: item.category,
+                            level: item.jlpt,
+                            questionText: item.completedSentence.isNotEmpty ? item.completedSentence : item.japanese,
+                            options: item.options,
+                            correctOption: item.correctOption,
+                          );
+                        },
+                      ),
+                      IconButton(
+                        icon: const Icon(Icons.copy_rounded, color: Color(0xFF6366F1), size: 20),
+                        tooltip: 'Copy question sentence',
+                        onPressed: () {
+                          final textToCopy = item.completedSentence.isNotEmpty ? item.completedSentence : item.japanese;
+                          ClipboardHelper.copy(context, textToCopy, label: 'Question sentence copied');
+                        },
+                      ),
+                    ],
                   ),
                 ],
               ),
               const SizedBox(height: 10),
+
+              // Centered TTS Speaker Button
+              Center(
+                child: Material(
+                  color: isDark ? Colors.white10 : const Color(0xFF6366F1).withValues(alpha: 0.1),
+                  shape: const CircleBorder(),
+                  child: InkWell(
+                    customBorder: const CircleBorder(),
+                    onTap: () {
+                      final textToSpeak = _isAnswerSubmitted
+                          ? (item.completedSentence.isNotEmpty ? item.completedSentence : item.japanese)
+                          : item.japanese.replaceAll('___', '');
+                      tts.speakJapanese(textToSpeak);
+                    },
+                    child: const Padding(
+                      padding: EdgeInsets.all(10),
+                      child: Icon(Icons.volume_up_rounded, color: Color(0xFF6366F1), size: 26),
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 10),
+
               GrammarJapaneseSentenceWidget(
-                text: question.japanese,
+                text: item.japanese,
                 showFurigana: theme.showFurigana,
                 isVibrant: theme.isVibrantText,
                 style: TextStyle(
@@ -440,17 +524,16 @@ class _SrsReviewScreenState extends State<SrsReviewScreen> {
         const SizedBox(height: 20),
 
         // Multiple Choice Options
-        ...question.getEffectiveOptions(topic.globalOptions).entries.map((entry) {
+        ...item.options.entries.map((entry) {
           final optionKey = entry.key;
           final optionLabel = entry.value;
-          final globalOpt = topic.globalOptions[optionKey];
 
           Color btnColor = cardColor;
           Color borderColor = isDark ? Colors.white12 : Colors.grey.shade200;
           Color labelColor = textColor;
 
           if (_isAnswerSubmitted) {
-            if (optionKey == question.correctOption) {
+            if (optionKey == item.correctOption) {
               btnColor = const Color(0xFF10B981).withValues(alpha: 0.15);
               borderColor = const Color(0xFF10B981);
               labelColor = const Color(0xFF10B981);
@@ -466,6 +549,9 @@ class _SrsReviewScreenState extends State<SrsReviewScreen> {
             child: InkWell(
               borderRadius: BorderRadius.circular(16),
               onTap: _isAnswerSubmitted ? null : () => _submitAnswer(optionKey),
+              onLongPress: () {
+                ClipboardHelper.copy(context, optionLabel, label: 'Option "$optionLabel" copied');
+              },
               child: Container(
                 padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
                 decoration: BoxDecoration(
@@ -479,7 +565,7 @@ class _SrsReviewScreenState extends State<SrsReviewScreen> {
                       width: 34,
                       height: 34,
                       decoration: BoxDecoration(
-                        color: _isAnswerSubmitted && optionKey == question.correctOption
+                        color: _isAnswerSubmitted && optionKey == item.correctOption
                             ? const Color(0xFF10B981)
                             : (_isAnswerSubmitted && optionKey == _selectedOption
                                 ? const Color(0xFFEF4444)
@@ -493,7 +579,7 @@ class _SrsReviewScreenState extends State<SrsReviewScreen> {
                           fontSize: 16,
                           fontWeight: FontWeight.bold,
                           color: _isAnswerSubmitted &&
-                                  (optionKey == question.correctOption || optionKey == _selectedOption)
+                                  (optionKey == item.correctOption || optionKey == _selectedOption)
                               ? Colors.white
                               : const Color(0xFF6366F1),
                         ),
@@ -501,36 +587,29 @@ class _SrsReviewScreenState extends State<SrsReviewScreen> {
                     ),
                     const SizedBox(width: 14),
                     Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            optionLabel,
-                            style: TextStyle(
-                              fontSize: 17,
-                              fontWeight: FontWeight.bold,
-                              color: labelColor,
-                            ),
-                          ),
-                          if (_isAnswerSubmitted && globalOpt != null && globalOpt.meaning.isNotEmpty) ...[
-                            const SizedBox(height: 2),
-                            Text(
-                              globalOpt.meaning,
-                              style: GoogleFonts.fredoka(
-                                fontSize: 12,
-                                color: subtextColor,
-                              ),
-                            ),
-                          ],
-                        ],
+                      child: Text(
+                        optionLabel,
+                        style: TextStyle(
+                          fontSize: 17,
+                          fontWeight: FontWeight.bold,
+                          color: labelColor,
+                        ),
                       ),
                     ),
-                    if (_isAnswerSubmitted && optionKey == question.correctOption)
-                      const Icon(Icons.check_circle_rounded, color: Color(0xFF10B981), size: 24),
-                    if (_isAnswerSubmitted &&
+                    if (_isAnswerSubmitted && optionKey == item.correctOption)
+                      const Icon(Icons.check_circle_rounded, color: Color(0xFF10B981), size: 24)
+                    else if (_isAnswerSubmitted &&
                         optionKey == _selectedOption &&
-                        optionKey != question.correctOption)
-                      const Icon(Icons.cancel_rounded, color: Color(0xFFEF4444), size: 24),
+                        optionKey != item.correctOption)
+                      const Icon(Icons.cancel_rounded, color: Color(0xFFEF4444), size: 24)
+                    else
+                      IconButton(
+                        icon: Icon(Icons.copy_rounded, size: 16, color: isDark ? Colors.white38 : Colors.grey.shade400),
+                        tooltip: 'Copy option',
+                        onPressed: () {
+                          ClipboardHelper.copy(context, optionLabel, label: 'Option "$optionLabel" copied');
+                        },
+                      ),
                   ],
                 ),
               ),
@@ -544,12 +623,12 @@ class _SrsReviewScreenState extends State<SrsReviewScreen> {
           Container(
             padding: const EdgeInsets.all(16),
             decoration: BoxDecoration(
-              color: _selectedOption == question.correctOption
+              color: _selectedOption == item.correctOption
                   ? const Color(0xFF10B981).withValues(alpha: 0.1)
                   : const Color(0xFFEF4444).withValues(alpha: 0.1),
               borderRadius: BorderRadius.circular(16),
               border: Border.all(
-                color: _selectedOption == question.correctOption
+                color: _selectedOption == item.correctOption
                     ? const Color(0xFF10B981).withValues(alpha: 0.3)
                     : const Color(0xFFEF4444).withValues(alpha: 0.3),
               ),
@@ -561,58 +640,62 @@ class _SrsReviewScreenState extends State<SrsReviewScreen> {
                 Row(
                   children: [
                     Icon(
-                      _selectedOption == question.correctOption
+                      _selectedOption == item.correctOption
                           ? Icons.check_circle_rounded
                           : Icons.warning_amber_rounded,
-                      color: _selectedOption == question.correctOption
+                      color: _selectedOption == item.correctOption
                           ? const Color(0xFF10B981)
                           : const Color(0xFFEF4444),
                       size: 20,
                     ),
                     const SizedBox(width: 8),
                     Text(
-                      _selectedOption == question.correctOption
+                      _selectedOption == item.correctOption
                           ? 'Correct! Promoted in SRS.'
-                          : 'Incorrect - Nuance Clarification:',
+                          : 'Incorrect - Review Explanation:',
                       style: GoogleFonts.fredoka(
                         fontSize: 14,
                         fontWeight: FontWeight.bold,
-                        color: _selectedOption == question.correctOption
+                        color: _selectedOption == item.correctOption
                             ? const Color(0xFF10B981)
                             : const Color(0xFFEF4444),
                       ),
                     ),
                   ],
                 ),
-                const SizedBox(height: 8),
-                GrammarJapaneseSentenceWidget(
-                  text: question.completedSentence,
-                  showFurigana: theme.showFurigana,
-                  isVibrant: theme.isVibrantText,
-                  textAlign: TextAlign.start,
-                  style: TextStyle(
-                    fontSize: 16,
-                    fontWeight: FontWeight.bold,
-                    color: textColor,
+                if (item.completedSentence.isNotEmpty) ...[
+                  const SizedBox(height: 8),
+                  GrammarJapaneseSentenceWidget(
+                    text: item.completedSentence,
+                    showFurigana: theme.showFurigana,
+                    isVibrant: theme.isVibrantText,
+                    textAlign: TextAlign.start,
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.bold,
+                      color: textColor,
+                    ),
                   ),
-                ),
-                const SizedBox(height: 4),
-                Text(
-                  question.english,
-                  style: GoogleFonts.fredoka(
-                    fontSize: 13,
-                    color: subtextColor,
-                    fontStyle: FontStyle.italic,
+                ],
+                if (item.english.isNotEmpty) ...[
+                  const SizedBox(height: 4),
+                  Text(
+                    item.english,
+                    style: GoogleFonts.fredoka(
+                      fontSize: 13,
+                      color: subtextColor,
+                      fontStyle: FontStyle.italic,
+                    ),
                   ),
-                ),
+                ],
                 const SizedBox(height: 10),
 
                 // Clarify what went wrong with chosen option
                 if (_selectedOption != null &&
-                    _selectedOption != question.correctOption &&
-                    question.explanation.wrong.containsKey(_selectedOption)) ...[
+                    _selectedOption != item.correctOption &&
+                    item.wrongExplanations.containsKey(_selectedOption)) ...[
                   Text(
-                    '❌ Why Option $_selectedOption (${question.getEffectiveOptions(topic.globalOptions)[_selectedOption] ?? ''}) is incorrect:',
+                    '❌ Why Option $_selectedOption (${item.options[_selectedOption] ?? ''}) is incorrect:',
                     style: GoogleFonts.fredoka(
                       fontSize: 13,
                       fontWeight: FontWeight.bold,
@@ -621,7 +704,7 @@ class _SrsReviewScreenState extends State<SrsReviewScreen> {
                   ),
                   const SizedBox(height: 3),
                   Text(
-                    question.explanation.wrong[_selectedOption]!,
+                    item.wrongExplanations[_selectedOption]!,
                     style: GoogleFonts.fredoka(
                       fontSize: 13,
                       color: isDark ? Colors.white70 : const Color(0xFF334155),
@@ -632,23 +715,25 @@ class _SrsReviewScreenState extends State<SrsReviewScreen> {
                 ],
 
                 // Explain why correct option fits
-                Text(
-                  '✅ Why Option ${question.correctOption} (${question.getEffectiveOptions(topic.globalOptions)[question.correctOption] ?? ''}) fits perfectly:',
-                  style: GoogleFonts.fredoka(
-                    fontSize: 13,
-                    fontWeight: FontWeight.bold,
-                    color: const Color(0xFF10B981),
+                if (item.explanation.isNotEmpty) ...[
+                  Text(
+                    '✅ Why Option ${item.correctOption} (${item.options[item.correctOption] ?? ''}) fits:',
+                    style: GoogleFonts.fredoka(
+                      fontSize: 13,
+                      fontWeight: FontWeight.bold,
+                      color: const Color(0xFF10B981),
+                    ),
                   ),
-                ),
-                const SizedBox(height: 3),
-                Text(
-                  question.explanation.correct,
-                  style: GoogleFonts.fredoka(
-                    fontSize: 13,
-                    color: isDark ? Colors.white70 : const Color(0xFF334155),
-                    height: 1.35,
+                  const SizedBox(height: 3),
+                  Text(
+                    item.explanation,
+                    style: GoogleFonts.fredoka(
+                      fontSize: 13,
+                      color: isDark ? Colors.white70 : const Color(0xFF334155),
+                      height: 1.35,
+                    ),
                   ),
-                ),
+                ],
               ],
             ),
           ),
@@ -672,9 +757,7 @@ class _SrsReviewScreenState extends State<SrsReviewScreen> {
           ),
         ],
 
-        // Bottom overflow container showing words in review
         const SizedBox(height: 26),
-       
       ],
     );
   }
@@ -792,11 +875,4 @@ class _SrsReviewScreenState extends State<SrsReviewScreen> {
       ],
     );
   }
-}
-
-class _ReviewItem {
-  final GrammarTopicModel topic;
-  final GrammarQuestion question;
-
-  _ReviewItem({required this.topic, required this.question});
 }

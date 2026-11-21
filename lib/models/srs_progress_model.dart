@@ -123,3 +123,37 @@ class SrsProgressModel {
     };
   }
 }
+
+class UnifiedReviewQuestion {
+  final dynamic id;
+  final String category; // 'grammar', 'vocab', 'kanji'
+  final String topicId;
+  final String topicTitle;
+  final String jlpt;
+  final String japanese;
+  final String english;
+  final String questionText;
+  final Map<String, String> options;
+  final String correctOption;
+  final String completedSentence;
+  final String explanation;
+  final Map<String, String> wrongExplanations;
+  final String badgeText;
+
+  UnifiedReviewQuestion({
+    required this.id,
+    required this.category,
+    required this.topicId,
+    required this.topicTitle,
+    required this.jlpt,
+    required this.japanese,
+    required this.english,
+    this.questionText = '',
+    required this.options,
+    required this.correctOption,
+    required this.completedSentence,
+    required this.explanation,
+    this.wrongExplanations = const {},
+    this.badgeText = '',
+  });
+}

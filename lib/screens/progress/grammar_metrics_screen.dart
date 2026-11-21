@@ -3,6 +3,7 @@ import 'package:google_fonts/google_fonts.dart';
 import 'package:provider/provider.dart';
 import '../../services/auth_service.dart';
 import '../../services/database_service.dart';
+import '../../services/analytics_service.dart';
 import '../../services/iap_service.dart';
 import '../../services/theme_service.dart';
 import '../../widgets/app_native_ad_widget.dart';
@@ -21,6 +22,18 @@ class GrammarMetricsScreen extends StatefulWidget {
 class _GrammarMetricsScreenState extends State<GrammarMetricsScreen> {
   // 0: All / Overview, 1: Grammar, 2: Vocabulary, 3: Kanji
   int _activeTab = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      try {
+        final analytics = Provider.of<AnalyticsService>(context, listen: false);
+        analytics.logScreenView(screenName: 'GrammarMetricsScreen');
+      } catch (_) {}
+    });
+  }
 
   @override
   Widget build(BuildContext context) {

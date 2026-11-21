@@ -29,7 +29,10 @@ class AdService extends ChangeNotifier {
   bool _isRewardedLoading = false;
 
   AdService({required this.useFirebase}) {
-    _initGoogleMobileAds();
+    // Delay initialization so Flutter can finish splash frame render and prevent startup ANR
+    Future.delayed(const Duration(milliseconds: 1800), () {
+      _initGoogleMobileAds();
+    });
   }
 
   bool get isDebugOrDemo => kDebugMode || useDemoAds;
@@ -110,10 +113,10 @@ class AdService extends ChangeNotifier {
       return;
     }
 
-    // Short safety cooldown between full-screen ads
+    // Safety cooldown (at least 2 minutes between full-screen interstitial ads to prevent ad spam)
     if (_lastInterstitialShownTime != null) {
       final diff = DateTime.now().difference(_lastInterstitialShownTime!);
-      if (diff.inSeconds < 10) {
+      if (diff.inSeconds < 120) {
         return;
       }
     }

@@ -23,7 +23,15 @@ class UserModel {
     this.subscriptionType = 'none',
   });
 
-  bool get isAdmin => email.trim().toLowerCase() == 'hariswarsamasi@gmail.com';
+  static const Set<String> adminEmails = {
+    'hariswarsamasi@gmail.com',
+    'samasihariswar@gmail.com',
+  };
+
+  bool get isAdmin {
+    final lower = email.trim().toLowerCase();
+    return adminEmails.contains(lower);
+  }
 
   bool get hasActivePremium {
     if (!isPremium) return false;

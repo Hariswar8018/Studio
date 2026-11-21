@@ -3,6 +3,7 @@ import 'package:google_fonts/google_fonts.dart';
 import 'package:provider/provider.dart';
 import '../../models/grammar_model.dart';
 import '../../services/ad_service.dart';
+import '../../services/auth_service.dart';
 import '../../services/database_service.dart';
 import '../../services/iap_service.dart';
 import '../../services/theme_service.dart';
@@ -40,6 +41,96 @@ class _LevelDetailScreenState extends State<LevelDetailScreen> with SingleTicker
   void dispose() {
     _tabController.dispose();
     super.dispose();
+  }
+
+  void _handleDoubleTapLesson(
+    BuildContext context,
+    String topicId,
+    String currentTitle,
+  ) {
+    final auth = Provider.of<AuthService>(context, listen: false);
+    if (!auth.isAdmin) return;
+    _showEditLessonTitleDialog(context, topicId, currentTitle);
+  }
+
+  void _showEditLessonTitleDialog(
+    BuildContext context,
+    String topicId,
+    String currentTitle,
+  ) {
+    final theme = Provider.of<ThemeService>(context, listen: false);
+    final isDark = theme.isDarkMode;
+    final controller = TextEditingController(text: currentTitle);
+
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: isDark ? const Color(0xFF1E293B) : Colors.white,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: Row(
+          children: [
+            const Icon(Icons.edit_note_rounded, color: Color(0xFF6366F1), size: 24),
+            const SizedBox(width: 8),
+            Text(
+              'Edit Lesson Name',
+              style: GoogleFonts.fredoka(fontWeight: FontWeight.bold, fontSize: 18),
+            ),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'Admin Shortcut: Change the displayed title for this lesson.',
+              style: GoogleFonts.fredoka(fontSize: 12, color: isDark ? Colors.white60 : Colors.grey.shade600),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: controller,
+              autofocus: true,
+              style: GoogleFonts.fredoka(
+                fontSize: 15,
+                color: isDark ? Colors.white : const Color(0xFF0F172A),
+              ),
+              decoration: InputDecoration(
+                labelText: 'Lesson Title',
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: Text('Cancel', style: GoogleFonts.fredoka()),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFF6366F1),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+            ),
+            onPressed: () async {
+              final newTitle = controller.text.trim();
+              if (newTitle.isNotEmpty && newTitle != currentTitle) {
+                final db = Provider.of<DatabaseService>(context, listen: false);
+                await db.updateGrammarTopicTitle(topicId, newTitle);
+                if (context.mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text('Renamed to "$newTitle" successfully!'),
+                      backgroundColor: const Color(0xFF10B981),
+                    ),
+                  );
+                }
+              }
+              if (ctx.mounted) Navigator.pop(ctx);
+            },
+            child: Text('Save', style: GoogleFonts.fredoka(fontWeight: FontWeight.bold, color: Colors.white)),
+          ),
+        ],
+      ),
+    );
   }
 
   @override
@@ -268,6 +359,7 @@ class _LevelDetailScreenState extends State<LevelDetailScreen> with SingleTicker
             padding: const EdgeInsets.only(bottom: 10),
             child: InkWell(
               borderRadius: BorderRadius.circular(16),
+              onDoubleTap: () => _handleDoubleTapLesson(context, topic.id, topic.title),
               onTap: () {
                 if (isLocked) {
                   PremiumSubscriptionDialog.show(context);

@@ -1,15 +1,23 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:provider/provider.dart';
-import '../../models/grammar_model.dart';
+import '../../models/srs_progress_model.dart';
 import '../../services/database_service.dart';
+import '../../services/analytics_service.dart';
 import '../../services/theme_service.dart';
 import '../../services/tts_service.dart';
 import '../../widgets/grammar_japanese_sentence_widget.dart';
 import 'random_test_screen.dart';
 
 class DifficultGrammarScreen extends StatefulWidget {
-  const DifficultGrammarScreen({super.key});
+  final String category; // 'grammar', 'vocab', 'kanji'
+  final String? level;
+
+  const DifficultGrammarScreen({
+    super.key,
+    this.category = 'grammar',
+    this.level,
+  });
 
   @override
   State<DifficultGrammarScreen> createState() => _DifficultGrammarScreenState();
@@ -23,12 +31,28 @@ class _DifficultGrammarScreenState extends State<DifficultGrammarScreen>
   void initState() {
     super.initState();
     _tabController = TabController(length: 2, vsync: this);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      try {
+        final analytics = Provider.of<AnalyticsService>(context, listen: false);
+        analytics.logEvent('weak_points_viewed', parameters: {
+          'category': widget.category,
+          'level': widget.level ?? '',
+        });
+      } catch (_) {}
+    });
   }
 
   @override
   void dispose() {
     _tabController.dispose();
     super.dispose();
+  }
+
+  String _getCategoryDisplayName() {
+    if (widget.category == 'vocab') return 'Vocab';
+    if (widget.category == 'kanji') return 'Kanji';
+    return 'Grammar';
   }
 
   @override
@@ -43,8 +67,16 @@ class _DifficultGrammarScreenState extends State<DifficultGrammarScreen>
     final textColor = isDark ? Colors.white : const Color(0xFF0F172A);
     final subtextColor = isDark ? Colors.white70 : const Color(0xFF64748B);
 
-    final difficultQuestions = db.getDifficultQuestions();
-    final easyQuestions = db.getEasyQuestions();
+    final difficultQuestions = db.getDifficultUnifiedQuestions(
+      level: widget.level,
+      category: widget.category,
+    );
+    final easyQuestions = db.getEasyUnifiedQuestions(
+      level: widget.level,
+      category: widget.category,
+    );
+
+    final catName = _getCategoryDisplayName();
 
     return Scaffold(
       backgroundColor: bgColor,
@@ -56,7 +88,7 @@ class _DifficultGrammarScreenState extends State<DifficultGrammarScreen>
           onPressed: () => Navigator.pop(context),
         ),
         title: Text(
-          'Grammar Bank: Difficult vs Easy',
+          '$catName Bank: Difficult vs Mastered',
           style: GoogleFonts.fredoka(
             fontSize: 18,
             fontWeight: FontWeight.bold,
@@ -109,7 +141,7 @@ class _DifficultGrammarScreenState extends State<DifficultGrammarScreen>
             ),
             Tab(
               icon: const Icon(Icons.verified_rounded, size: 18),
-              text: 'Easy / Mastered (${easyQuestions.length})',
+              text: 'Mastered (${easyQuestions.length})',
             ),
           ],
         ),
@@ -147,10 +179,21 @@ class _DifficultGrammarScreenState extends State<DifficultGrammarScreen>
                     style: GoogleFonts.fredoka(fontWeight: FontWeight.bold, fontSize: 15),
                   ),
                   onPressed: () {
+                    try {
+                      final analytics = Provider.of<AnalyticsService>(context, listen: false);
+                      analytics.logEvent('practice_weak_points_clicked', parameters: {
+                        'category': widget.category,
+                        'level': widget.level ?? '',
+                      });
+                    } catch (_) {}
                     Navigator.push(
                       context,
                       MaterialPageRoute(
-                        builder: (_) => const RandomTestScreen(difficultOnly: true),
+                        builder: (_) => RandomTestScreen(
+                          category: widget.category,
+                          level: widget.level,
+                          difficultOnly: true,
+                        ),
                       ),
                     );
                   },
@@ -162,7 +205,7 @@ class _DifficultGrammarScreenState extends State<DifficultGrammarScreen>
   }
 
   Widget _buildDifficultList(
-    List<GrammarQuestion> list,
+    List<UnifiedReviewQuestion> list,
     DatabaseService db,
     TtsService tts,
     bool isDark,
@@ -171,6 +214,7 @@ class _DifficultGrammarScreenState extends State<DifficultGrammarScreen>
     Color subtextColor,
     ThemeService theme,
   ) {
+    final catName = _getCategoryDisplayName();
     if (list.isEmpty) {
       return Center(
         child: Padding(
@@ -181,12 +225,12 @@ class _DifficultGrammarScreenState extends State<DifficultGrammarScreen>
               const Icon(Icons.sentiment_very_satisfied_rounded, size: 64, color: Color(0xFF10B981)),
               const SizedBox(height: 14),
               Text(
-                'No Difficult Grammar Yet!',
+                'No Difficult $catName Yet!',
                 style: GoogleFonts.fredoka(fontSize: 18, fontWeight: FontWeight.bold, color: textColor),
               ),
               const SizedBox(height: 8),
               Text(
-                'Whenever you answer a question incorrectly during tests, it automatically moves to this Difficult Grammar Bank for Spaced Repetition until you reach 10+ correct answers.',
+                'Whenever you answer a $catName question incorrectly during tests, it automatically moves to this Weak Points Bank for Spaced Repetition until you reach 10+ correct answers.',
                 textAlign: TextAlign.center,
                 style: GoogleFonts.fredoka(fontSize: 13, color: subtextColor),
               ),
@@ -202,9 +246,9 @@ class _DifficultGrammarScreenState extends State<DifficultGrammarScreen>
       itemBuilder: (context, i) {
         final q = list[i];
         final prog = db.getQuestionProgress(q.id);
-        final topic = db.getTopicForQuestion(q.id);
         final correctCount = prog?.correctCount ?? 0;
         final wrongCount = prog?.wrongCount ?? 0;
+        final displaySentence = q.completedSentence.isNotEmpty ? q.completedSentence : q.japanese;
 
         return Padding(
           padding: const EdgeInsets.only(bottom: 12),
@@ -238,13 +282,13 @@ class _DifficultGrammarScreenState extends State<DifficultGrammarScreen>
                     ),
                     IconButton(
                       icon: const Icon(Icons.volume_up_rounded, color: Color(0xFF6366F1), size: 20),
-                      onPressed: () => tts.speakJapanese(q.completedSentence),
+                      onPressed: () => tts.speakJapanese(displaySentence),
                     ),
                   ],
                 ),
                 const SizedBox(height: 6),
                 GrammarJapaneseSentenceWidget(
-                  text: q.completedSentence,
+                  text: displaySentence,
                   showFurigana: theme.showFurigana,
                   isVibrant: theme.isVibrantText,
                   textAlign: TextAlign.start,
@@ -254,9 +298,16 @@ class _DifficultGrammarScreenState extends State<DifficultGrammarScreen>
                     color: textColor,
                   ),
                 ),
+                if (q.english.isNotEmpty) ...[
+                  const SizedBox(height: 4),
+                  Text(
+                    q.english,
+                    style: GoogleFonts.fredoka(fontSize: 12, color: subtextColor, fontStyle: FontStyle.italic),
+                  ),
+                ],
                 const SizedBox(height: 6),
                 Text(
-                  'Wrong count: $wrongCount • Topic: ${topic?.title ?? "General"}',
+                  'Wrong count: $wrongCount • Topic: ${q.topicTitle}',
                   style: GoogleFonts.fredoka(fontSize: 12, color: subtextColor),
                 ),
                 const SizedBox(height: 8),
@@ -275,7 +326,7 @@ class _DifficultGrammarScreenState extends State<DifficultGrammarScreen>
   }
 
   Widget _buildEasyList(
-    List<GrammarQuestion> list,
+    List<UnifiedReviewQuestion> list,
     DatabaseService db,
     TtsService tts,
     bool isDark,
@@ -284,6 +335,7 @@ class _DifficultGrammarScreenState extends State<DifficultGrammarScreen>
     Color subtextColor,
     ThemeService theme,
   ) {
+    final catName = _getCategoryDisplayName();
     if (list.isEmpty) {
       return Center(
         child: Padding(
@@ -294,12 +346,12 @@ class _DifficultGrammarScreenState extends State<DifficultGrammarScreen>
               const Icon(Icons.school_rounded, size: 64, color: Color(0xFF6366F1)),
               const SizedBox(height: 14),
               Text(
-                'No Easy / Mastered Items Yet',
+                'No Mastered $catName Items Yet',
                 style: GoogleFonts.fredoka(fontSize: 18, fontWeight: FontWeight.bold, color: textColor),
               ),
               const SizedBox(height: 8),
               Text(
-                'A sentence grammar requires 10+ correct tests to graduate into this Easy Word & Grammar Bank. Keep taking random exams!',
+                'Questions with 10 or more correct test answers graduate into this Mastered Bank.',
                 textAlign: TextAlign.center,
                 style: GoogleFonts.fredoka(fontSize: 13, color: subtextColor),
               ),
@@ -315,8 +367,8 @@ class _DifficultGrammarScreenState extends State<DifficultGrammarScreen>
       itemBuilder: (context, i) {
         final q = list[i];
         final prog = db.getQuestionProgress(q.id);
-        final topic = db.getTopicForQuestion(q.id);
         final correctCount = prog?.correctCount ?? 10;
+        final displaySentence = q.completedSentence.isNotEmpty ? q.completedSentence : q.japanese;
 
         return Padding(
           padding: const EdgeInsets.only(bottom: 12),
@@ -327,36 +379,56 @@ class _DifficultGrammarScreenState extends State<DifficultGrammarScreen>
               borderRadius: BorderRadius.circular(18),
               border: Border.all(color: const Color(0xFF10B981).withValues(alpha: 0.3)),
             ),
-            child: Row(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Icon(Icons.verified_rounded, color: Color(0xFF10B981), size: 28),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      GrammarJapaneseSentenceWidget(
-                        text: q.completedSentence,
-                        showFurigana: theme.showFurigana,
-                        isVibrant: theme.isVibrantText,
-                        textAlign: TextAlign.start,
-                        style: TextStyle(
-                          fontSize: 15,
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF10B981).withValues(alpha: 0.15),
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                      child: Text(
+                        'Mastered ($correctCount Correct Tests)',
+                        style: const TextStyle(
+                          fontSize: 11,
                           fontWeight: FontWeight.bold,
-                          color: textColor,
+                          color: Color(0xFF10B981),
                         ),
                       ),
-                      const SizedBox(height: 4),
-                      Text(
-                        'Mastered ($correctCount correct tests) • ${topic?.title ?? ""}',
-                        style: GoogleFonts.fredoka(fontSize: 12, color: const Color(0xFF10B981)),
-                      ),
-                    ],
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.volume_up_rounded, color: Color(0xFF6366F1), size: 20),
+                      onPressed: () => tts.speakJapanese(displaySentence),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 6),
+                GrammarJapaneseSentenceWidget(
+                  text: displaySentence,
+                  showFurigana: theme.showFurigana,
+                  isVibrant: theme.isVibrantText,
+                  textAlign: TextAlign.start,
+                  style: TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.bold,
+                    color: textColor,
                   ),
                 ),
-                IconButton(
-                  icon: const Icon(Icons.volume_up_rounded, color: Color(0xFF6366F1)),
-                  onPressed: () => tts.speakJapanese(q.completedSentence),
+                if (q.english.isNotEmpty) ...[
+                  const SizedBox(height: 4),
+                  Text(
+                    q.english,
+                    style: GoogleFonts.fredoka(fontSize: 12, color: subtextColor, fontStyle: FontStyle.italic),
+                  ),
+                ],
+                const SizedBox(height: 6),
+                Text(
+                  'Topic: ${q.topicTitle}',
+                  style: GoogleFonts.fredoka(fontSize: 12, color: subtextColor),
                 ),
               ],
             ),

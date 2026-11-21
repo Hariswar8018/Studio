@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:provider/provider.dart';
 import '../../services/auth_service.dart';
+import '../../services/analytics_service.dart';
 import '../../services/theme_service.dart';
 import '../home/home_screen.dart';
 
@@ -129,10 +130,19 @@ class _LoginScreenState extends State<LoginScreen> {
 
     if (!mounted) return;
     if (err != null) {
+      try {
+        final analytics = Provider.of<AnalyticsService>(context, listen: false);
+        analytics.logEvent('login_failed', parameters: {'method': 'google', 'error': err});
+      } catch (_) {}
       if (!err.toLowerCase().contains('cancel')) {
         _showErrorDialog('Google Sign-In', err);
       }
     } else {
+      try {
+        final analytics = Provider.of<AnalyticsService>(context, listen: false);
+        analytics.logEvent('login', parameters: {'method': 'google'});
+        analytics.setUserId(auth.currentUser?.uid);
+      } catch (_) {}
       Navigator.pushReplacement(
         context,
         MaterialPageRoute(builder: (_) => const HomeScreen()),
@@ -146,10 +156,19 @@ class _LoginScreenState extends State<LoginScreen> {
 
     if (!mounted) return;
     if (err != null) {
+      try {
+        final analytics = Provider.of<AnalyticsService>(context, listen: false);
+        analytics.logEvent('login_failed', parameters: {'method': 'twitter', 'error': err});
+      } catch (_) {}
       if (!err.toLowerCase().contains('cancel')) {
         _showErrorDialog('X Sign-In', err);
       }
     } else {
+      try {
+        final analytics = Provider.of<AnalyticsService>(context, listen: false);
+        analytics.logEvent('login', parameters: {'method': 'twitter'});
+        analytics.setUserId(auth.currentUser?.uid);
+      } catch (_) {}
       Navigator.pushReplacement(
         context,
         MaterialPageRoute(builder: (_) => const HomeScreen()),
@@ -182,8 +201,17 @@ class _LoginScreenState extends State<LoginScreen> {
 
     if (!mounted) return;
     if (err != null) {
+      try {
+        final analytics = Provider.of<AnalyticsService>(context, listen: false);
+        analytics.logEvent(_isSignUp ? 'sign_up_failed' : 'login_failed', parameters: {'method': 'email', 'error': err});
+      } catch (_) {}
       _showErrorDialog(_isSignUp ? 'Sign Up Failed' : 'Sign In Failed', err);
     } else {
+      try {
+        final analytics = Provider.of<AnalyticsService>(context, listen: false);
+        analytics.logEvent(_isSignUp ? 'sign_up' : 'login', parameters: {'method': 'email'});
+        analytics.setUserId(auth.currentUser?.uid);
+      } catch (_) {}
       Navigator.pushReplacement(
         context,
         MaterialPageRoute(builder: (_) => const HomeScreen()),

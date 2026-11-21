@@ -54,22 +54,70 @@ class KanjiQuestion {
 
   factory KanjiQuestion.fromMap(Map<String, dynamic> map) {
     final opts = <String, String>{};
-    if (map['options'] is Map) {
-      (map['options'] as Map).forEach((k, v) {
+    final rawOptions = map['options'] ?? map['choices'] ?? map['answers'];
+    if (rawOptions is Map) {
+      rawOptions.forEach((k, v) {
         opts[k.toString()] = v?.toString() ?? '';
       });
+    } else if (rawOptions is List) {
+      final labels = ['A', 'B', 'C', 'D', 'E', 'F'];
+      for (int i = 0; i < rawOptions.length; i++) {
+        final key = i < labels.length ? labels[i] : (i + 1).toString();
+        opts[key] = rawOptions[i]?.toString() ?? '';
+      }
     }
+
+    final rawCorrect = map['correctOption'] ??
+        map['correct_option'] ??
+        map['correct'] ??
+        map['answer'] ??
+        map['correctAnswer'];
+
+    String resolvedCorrect = '';
+    if (rawCorrect is int) {
+      const labels = ['A', 'B', 'C', 'D', 'E', 'F'];
+      if (rawCorrect >= 0 && rawCorrect < labels.length) {
+        resolvedCorrect = labels[rawCorrect];
+      } else {
+        resolvedCorrect = rawCorrect.toString();
+      }
+    } else if (rawCorrect != null) {
+      final str = rawCorrect.toString().trim();
+      if (str == '0') {
+        resolvedCorrect = 'A';
+      } else if (str == '1' && !opts.containsKey('1') && opts.containsKey('A')) {
+        resolvedCorrect = 'A';
+      } else if (str == '2' && !opts.containsKey('2') && opts.containsKey('B')) {
+        resolvedCorrect = 'B';
+      } else if (str == '3' && !opts.containsKey('3') && opts.containsKey('C')) {
+        resolvedCorrect = 'C';
+      } else if (str == '4' && !opts.containsKey('4') && opts.containsKey('D')) {
+        resolvedCorrect = 'D';
+      } else if (!opts.containsKey(str)) {
+        for (final entry in opts.entries) {
+          if (entry.value.trim() == str) {
+            resolvedCorrect = entry.key;
+            break;
+          }
+        }
+        if (resolvedCorrect.isEmpty) resolvedCorrect = str;
+      } else {
+        resolvedCorrect = str;
+      }
+    }
+
+    final rawExp = map['explanation'] ?? map['explanation_text'] ?? map['detail'] ?? map['reason'];
 
     return KanjiQuestion(
       id: map['id'] ?? 0,
       type: map['type']?.toString() ?? 'kanjiReading',
-      japanese: map['japanese']?.toString() ?? '',
-      english: map['english']?.toString() ?? '',
+      japanese: map['japanese']?.toString() ?? map['sentence']?.toString() ?? map['jp']?.toString() ?? '',
+      english: map['english']?.toString() ?? map['translation']?.toString() ?? map['meaning']?.toString() ?? map['en']?.toString() ?? '',
       question: map['question']?.toString() ?? '',
       options: opts,
-      correctOption: map['correctOption']?.toString() ?? 'A',
-      completedSentence: map['completedSentence']?.toString() ?? '',
-      explanation: QuestionExplanation.fromMap(map['explanation']),
+      correctOption: resolvedCorrect.isNotEmpty ? resolvedCorrect : 'A',
+      completedSentence: map['completedSentence']?.toString() ?? map['completed_sentence']?.toString() ?? map['fullSentence']?.toString() ?? '',
+      explanation: QuestionExplanation.fromMap(rawExp),
     );
   }
 
@@ -112,10 +160,25 @@ class KanjiItem {
   });
 
   factory KanjiItem.fromMap(Map<String, dynamic> map) {
+    String char = map['character']?.toString() ??
+        map['word']?.toString() ??
+        map['kanji']?.toString() ??
+        map['char']?.toString() ??
+        map['item']?.toString() ??
+        map['name']?.toString() ??
+        '';
+    if (char.isEmpty && map['kanjiCharacters'] is List && (map['kanjiCharacters'] as List).isNotEmpty) {
+      char = (map['kanjiCharacters'] as List).join('');
+    }
+
     final on = <String>[];
     if (map['onyomi'] is List) {
       for (final o in map['onyomi']) {
         on.add(o.toString());
+      }
+    } else if (map['onyomi'] is String && map['onyomi'].toString().isNotEmpty) {
+      for (final o in map['onyomi'].toString().split(RegExp(r'[,、]'))) {
+        if (o.trim().isNotEmpty) on.add(o.trim());
       }
     }
 
@@ -124,6 +187,29 @@ class KanjiItem {
       for (final k in map['kunyomi']) {
         kun.add(k.toString());
       }
+    } else if (map['kunyomi'] is String && map['kunyomi'].toString().isNotEmpty) {
+      for (final k in map['kunyomi'].toString().split(RegExp(r'[,、]'))) {
+        if (k.trim().isNotEmpty) kun.add(k.trim());
+      }
+    }
+
+    // If on and kun are empty, check 'reading' or 'kana' or 'readings'
+    if (on.isEmpty && kun.isEmpty) {
+      final rawReading = map['reading']?.toString() ?? map['kana']?.toString() ?? map['readings']?.toString() ?? '';
+      if (rawReading.isNotEmpty) {
+        for (final r in rawReading.split(RegExp(r'[,、;/]'))) {
+          final trimmed = r.trim();
+          if (trimmed.isEmpty) continue;
+          if (RegExp(r'[\u30A0-\u30FF]').hasMatch(trimmed)) {
+            on.add(trimmed);
+          } else {
+            kun.add(trimmed);
+          }
+        }
+        if (on.isEmpty && kun.isEmpty) {
+          kun.add(rawReading.trim());
+        }
+      }
     }
 
     final mList = <String>[];
@@ -131,22 +217,62 @@ class KanjiItem {
       for (final m in map['meanings']) {
         mList.add(m.toString());
       }
+    } else if (map['meaning'] != null) {
+      final rawMeaning = map['meaning'].toString();
+      for (final part in rawMeaning.split(RegExp(r'[;,]'))) {
+        final trimmed = part.trim();
+        if (trimmed.isNotEmpty && !mList.contains(trimmed)) {
+          mList.add(trimmed);
+        }
+      }
+    } else if (map['english'] != null) {
+      mList.add(map['english'].toString());
+    } else if (map['translation'] != null) {
+      mList.add(map['translation'].toString());
     }
 
     final words = <KanjiCommonWord>[];
-    if (map['commonWords'] is List) {
-      for (final w in map['commonWords']) {
+    final rawWords = map['commonWords'] ?? map['compounds'] ?? map['words'] ?? map['examples'];
+    if (rawWords is List) {
+      for (final w in rawWords) {
         if (w is Map<String, dynamic>) {
           words.add(KanjiCommonWord.fromMap(w));
         } else if (w is Map) {
           words.add(KanjiCommonWord.fromMap(Map<String, dynamic>.from(w)));
+        } else if (w is String) {
+          words.add(KanjiCommonWord(word: w, reading: '', meaning: ''));
         }
+      }
+    }
+    if (words.isEmpty && map['exampleSentence'] is Map) {
+      final ex = map['exampleSentence'] as Map;
+      final jp = ex['japanese']?.toString() ?? '';
+      final en = ex['english']?.toString() ?? '';
+      if (jp.isNotEmpty) {
+        words.add(KanjiCommonWord(
+          word: char.isNotEmpty ? char : jp,
+          reading: kun.isNotEmpty ? kun.first : (on.isNotEmpty ? on.first : ''),
+          meaning: en.isNotEmpty ? en : (mList.isNotEmpty ? mList.first : ''),
+        ));
+      }
+    }
+
+    String exp = map['explanation']?.toString() ?? map['notes']?.toString() ?? map['nuance']?.toString() ?? '';
+    if (exp.isEmpty && map['exampleSentence'] != null) {
+      final ex = map['exampleSentence'];
+      if (ex is Map) {
+        final jp = ex['japanese']?.toString() ?? '';
+        final en = ex['english']?.toString() ?? '';
+        exp = '例文: $jp${en.isNotEmpty ? ' ($en)' : ''}';
+      } else if (ex is String && ex.trim().isNotEmpty) {
+        exp = '例文: ${ex.trim()}';
       }
     }
 
     final questionsList = <KanjiQuestion>[];
-    if (map['questions'] is List) {
-      for (final q in map['questions']) {
+    final rawQuestions = map['questions'] ?? map['quiz'] ?? map['exercises'];
+    if (rawQuestions is List) {
+      for (final q in rawQuestions) {
         if (q is Map<String, dynamic>) {
           questionsList.add(KanjiQuestion.fromMap(q));
         } else if (q is Map) {
@@ -157,12 +283,12 @@ class KanjiItem {
 
     return KanjiItem(
       id: map['id']?.toString() ?? '',
-      character: map['character']?.toString() ?? '',
+      character: char,
       onyomi: on,
       kunyomi: kun,
       meanings: mList,
-      strokeCount: int.tryParse(map['strokeCount']?.toString() ?? '1') ?? 1,
-      explanation: map['explanation']?.toString() ?? '',
+      strokeCount: int.tryParse(map['strokeCount']?.toString() ?? map['strokes']?.toString() ?? '1') ?? 1,
+      explanation: exp,
       commonWords: words,
       questions: questionsList,
     );
@@ -211,8 +337,9 @@ class KanjiTopicModel {
     }
 
     final kanjiList = <KanjiItem>[];
-    if (map['kanji'] is List) {
-      for (final k in map['kanji']) {
+    final rawKanji = map['kanji'] ?? map['items'] ?? map['characters'] ?? map['entries'] ?? map['words'] ?? map['vocabulary'];
+    if (rawKanji is List) {
+      for (final k in rawKanji) {
         if (k is Map<String, dynamic>) {
           kanjiList.add(KanjiItem.fromMap(k));
         } else if (k is Map) {

@@ -4,14 +4,18 @@ import 'package:flutter_kanjivg/flutter_kanjivg.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:provider/provider.dart';
 import '../../models/kanji_model.dart';
+import '../../services/auth_service.dart';
 import '../../services/database_service.dart';
 import '../../services/kanji_service.dart';
 import '../../services/theme_service.dart';
 import '../../services/tts_service.dart';
 import '../../services/ad_service.dart';
+import '../../services/analytics_service.dart';
 import '../../services/iap_service.dart';
 import '../../widgets/grammar_japanese_sentence_widget.dart';
 import '../../widgets/app_native_ad_widget.dart';
+import '../../widgets/clipboard_helper.dart';
+import '../../widgets/question_report_dialog.dart';
 import '../../widgets/premium_subscription_dialog.dart';
 
 class KanjiLearnScreen extends StatefulWidget {
@@ -40,11 +44,16 @@ class _KanjiLearnScreenState extends State<KanjiLearnScreen> with TickerProvider
   int _currentStrokeStep = 0;
 
   // Practice state
+  bool _isFullPracticeTest = false;
   late List<KanjiQuestion> _currentQuestions;
   int _currentQuestionIndex = 0;
   String? _selectedOption;
   bool _isAnswerSubmitted = false;
   int _correctCount = 0;
+
+  int get _totalQuestionsInTopic {
+    return widget.topic.kanji.fold<int>(0, (sum, item) => sum + item.questions.length);
+  }
 
   @override
   void initState() {
@@ -57,6 +66,18 @@ class _KanjiLearnScreenState extends State<KanjiLearnScreen> with TickerProvider
       if (mounted) setState(() {});
     });
     _loadCurrentKanji();
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        final analytics = Provider.of<AnalyticsService>(context, listen: false);
+        analytics.logLessonStarted(
+          lessonId: widget.topic.id,
+          level: widget.topic.jlpt,
+          category: 'kanji',
+          title: widget.topic.title,
+        );
+      }
+    });
   }
 
   @override
@@ -68,7 +89,7 @@ class _KanjiLearnScreenState extends State<KanjiLearnScreen> with TickerProvider
   void _loadCurrentKanji() {
     if (widget.topic.kanji.isNotEmpty) {
       final kanji = widget.topic.kanji[_selectedKanjiIndex];
-      _currentQuestions = List.from(kanji.questions);
+      _currentQuestions = List<KanjiQuestion>.from(kanji.questions)..shuffle();
       _userStrokes.clear();
       _currentStrokeStep = 0;
       _loadKvgData(kanji.character);
@@ -77,11 +98,184 @@ class _KanjiLearnScreenState extends State<KanjiLearnScreen> with TickerProvider
     }
   }
 
+  Future<bool> _handlePracticeBack() async {
+    if (!_inPracticeMode || _currentQuestionIndex >= _currentQuestions.length) {
+      return true;
+    }
+
+    final db = Provider.of<DatabaseService>(context, listen: false);
+
+    // If user answered at least 3 questions in full test, mark lesson as complete so it adds to SRS review
+    if (_currentQuestionIndex >= 2 || _correctCount >= 3) {
+      await db.markKanjiCompleted(widget.topic.id);
+    }
+
+    // Save current progress before asking
+    await db.savePracticeProgress(
+      topicId: widget.topic.id,
+      category: 'kanji',
+      currentIndex: _currentQuestionIndex,
+      correctCount: _correctCount,
+      questionIds: _currentQuestions.map((q) => q.id).toList(),
+      isFullPractice: _isFullPracticeTest,
+    );
+
+    if (!mounted) return false;
+
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final shouldExit = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: isDark ? const Color(0xFF1E293B) : Colors.white,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: Row(
+          children: [
+            const Icon(Icons.pause_circle_filled_rounded, color: Color(0xFF8B5CF6), size: 26),
+            const SizedBox(width: 10),
+            Text(
+              'Pause Practice?',
+              style: GoogleFonts.fredoka(fontWeight: FontWeight.bold, fontSize: 18),
+            ),
+          ],
+        ),
+        content: Text(
+          'Your progress on Question ${_currentQuestionIndex + 1} of ${_currentQuestions.length} has been saved.\n\n${(_currentQuestionIndex >= 2 || _correctCount >= 3) ? "✅ Lesson marked completed (3+ questions answered) and added to SRS review!\n\n" : ""}Would you like to exit to study mode or keep practicing?',
+          style: GoogleFonts.fredoka(fontSize: 14),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: Text('Resume Practice', style: GoogleFonts.fredoka(fontWeight: FontWeight.bold, color: const Color(0xFF8B5CF6))),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFFEF4444),
+              foregroundColor: Colors.white,
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+            ),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: Text('Save & Exit', style: GoogleFonts.fredoka(fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
+    );
+
+    if (shouldExit == true) {
+      setState(() => _inPracticeMode = false);
+      return false;
+    }
+    return false;
+  }
+
+  Future<void> _checkAndStartFullPractice() async {
+    final db = Provider.of<DatabaseService>(context, listen: false);
+    final saved = await db.getPracticeProgress(widget.topic.id);
+
+    if (saved != null && saved.currentIndex > 0 && saved.currentIndex < _totalQuestionsInTopic) {
+      if (!mounted) return;
+      final isDark = Theme.of(context).brightness == Brightness.dark;
+
+      final choice = await showDialog<String>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          backgroundColor: isDark ? const Color(0xFF1E293B) : Colors.white,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+          title: Row(
+            children: [
+              const Icon(Icons.history_rounded, color: Color(0xFF8B5CF6), size: 26),
+              const SizedBox(width: 10),
+              Text(
+                'Resume Practice?',
+                style: GoogleFonts.fredoka(fontWeight: FontWeight.bold, fontSize: 18),
+              ),
+            ],
+          ),
+          content: Text(
+            'You previously stopped at Question ${saved.currentIndex + 1} of ${saved.questionIds.length} (${saved.correctCount} correct).\n\nWould you like to continue from where you left off or start a full random test?',
+            style: GoogleFonts.fredoka(fontSize: 14),
+          ),
+          actions: [
+            OutlinedButton(
+              style: OutlinedButton.styleFrom(
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+              ),
+              onPressed: () => Navigator.pop(ctx, 'fresh'),
+              child: Text('Start Fresh (Random)', style: GoogleFonts.fredoka(fontWeight: FontWeight.bold)),
+            ),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFF8B5CF6),
+                foregroundColor: Colors.white,
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+              ),
+              onPressed: () => Navigator.pop(ctx, 'resume'),
+              child: Text('Resume (Q ${saved.currentIndex + 1})', style: GoogleFonts.fredoka(fontWeight: FontWeight.bold)),
+            ),
+          ],
+        ),
+      );
+
+      if (choice == 'resume') {
+        final allQ = <KanjiQuestion>[];
+        for (final k in widget.topic.kanji) {
+          allQ.addAll(k.questions);
+        }
+        final qMap = {for (var q in allQ) q.id.toString(): q};
+        final orderedQuestions = <KanjiQuestion>[];
+        for (var id in saved.questionIds) {
+          if (qMap.containsKey(id)) {
+            orderedQuestions.add(qMap[id]!);
+          }
+        }
+        for (var q in allQ) {
+          if (!orderedQuestions.contains(q)) {
+            orderedQuestions.add(q);
+          }
+        }
+
+        setState(() {
+          _isFullPracticeTest = saved.isFullPractice;
+          _currentQuestions = orderedQuestions;
+          _currentQuestionIndex = saved.currentIndex.clamp(0, orderedQuestions.length - 1);
+          _correctCount = saved.correctCount;
+          _selectedOption = null;
+          _isAnswerSubmitted = false;
+          _inPracticeMode = true;
+        });
+        return;
+      } else if (choice == 'fresh') {
+        await db.clearPracticeProgress(widget.topic.id);
+      } else {
+        return;
+      }
+    }
+
+    _startFullPracticeTest();
+  }
+
+  void _startFullPracticeTest() {
+    final allQuestions = <KanjiQuestion>[];
+    for (final kanji in widget.topic.kanji) {
+      allQuestions.addAll(kanji.questions);
+    }
+    allQuestions.shuffle();
+    setState(() {
+      _isFullPracticeTest = true;
+      _currentQuestions = allQuestions;
+      _inPracticeMode = true;
+      _currentQuestionIndex = 0;
+      _selectedOption = null;
+      _isAnswerSubmitted = false;
+      _correctCount = 0;
+    });
+  }
+
   Future<void> _loadKvgData(String char) async {
     if (char.isEmpty) return;
     setState(() => _isLoadingKvg = true);
     try {
-      final data = await KanjiService.instance.getKanjiData(char);
+      final targetChar = char.characters.isNotEmpty ? char.characters.first : char;
+      final data = await KanjiService.instance.getKanjiData(targetChar);
       if (mounted) {
         setState(() {
           _currentKvgData = data;
@@ -121,6 +315,7 @@ class _KanjiLearnScreenState extends State<KanjiLearnScreen> with TickerProvider
 
   void _startPracticeForKanji(int index) {
     setState(() {
+      _isFullPracticeTest = false;
       _selectedKanjiIndex = index;
       _loadCurrentKanji();
       _inPracticeMode = true;
@@ -142,6 +337,36 @@ class _KanjiLearnScreenState extends State<KanjiLearnScreen> with TickerProvider
       _isAnswerSubmitted = true;
       if (isCorrect) _correctCount++;
     });
+
+    // Log Question Answered Analytics
+    try {
+      final analytics = Provider.of<AnalyticsService>(context, listen: false);
+      analytics.logQuestionAnswered(
+        lessonId: widget.topic.id,
+        category: 'kanji',
+        questionIndex: _currentQuestionIndex,
+        questionId: question.id,
+        isCorrect: isCorrect,
+        selectedOption: optionKey,
+        correctOption: question.correctOption,
+      );
+    } catch (_) {}
+
+    // Save progress after answering
+    final db = Provider.of<DatabaseService>(context, listen: false);
+    db.savePracticeProgress(
+      topicId: widget.topic.id,
+      category: 'kanji',
+      currentIndex: _currentQuestionIndex,
+      correctCount: _correctCount,
+      questionIds: _currentQuestions.map((q) => q.id).toList(),
+      isFullPractice: _isFullPracticeTest,
+    );
+
+    // If user answered at least 3 questions in full practice test, mark Lesson as Complete so it adds to SRS review
+    if (_isFullPracticeTest && (_currentQuestionIndex >= 2 || _correctCount >= 3)) {
+      db.markKanjiCompleted(widget.topic.id);
+    }
 
     // Speak full sentence audio on correct or wrong
     try {
@@ -173,9 +398,23 @@ class _KanjiLearnScreenState extends State<KanjiLearnScreen> with TickerProvider
         _currentQuestionIndex++; // Points to completed
       });
 
-      // Mark Kanji as completed
+      // Mark Kanji as completed & clear in-progress state
       final db = Provider.of<DatabaseService>(context, listen: false);
       db.markKanjiCompleted(widget.topic.id);
+      db.clearPracticeProgress(widget.topic.id);
+
+      // Log Lesson Completed Analytics
+      try {
+        final analytics = Provider.of<AnalyticsService>(context, listen: false);
+        analytics.logLessonCompleted(
+          lessonId: widget.topic.id,
+          level: widget.topic.jlpt,
+          category: 'kanji',
+          score: _correctCount,
+          totalQuestions: _currentQuestions.length,
+          title: widget.topic.title,
+        );
+      } catch (_) {}
 
       // Trigger interstitial ad
       final adService = Provider.of<AdService>(context, listen: false);
@@ -190,32 +429,45 @@ class _KanjiLearnScreenState extends State<KanjiLearnScreen> with TickerProvider
     final tts = Provider.of<TtsService>(context);
     final db = Provider.of<DatabaseService>(context);
     final iap = Provider.of<IapService>(context);
+    final auth = Provider.of<AuthService>(context);
     final isDark = theme.isDarkMode;
+    final isAdmin = auth.isAdmin;
 
     final bgColor = isDark ? const Color(0xFF0B1120) : const Color(0xFFF8FAFC);
     final cardColor = isDark ? const Color(0xFF1E293B) : Colors.white;
     final textColor = isDark ? Colors.white : const Color(0xFF0F172A);
     final subtextColor = isDark ? Colors.white70 : const Color(0xFF64748B);
 
-    final isLocked = db.isKanjiTopicLocked(widget.topic.id, iap.isPremium);
+    final isLocked = db.isKanjiTopicLocked(widget.topic.id, iap.isPremium, isAdmin: isAdmin);
 
-    return Scaffold(
-      backgroundColor: bgColor,
-      appBar: AppBar(
-        backgroundColor: isDark ? const Color(0xFF0F172A) : Colors.white,
-        elevation: 0,
-        leading: IconButton(
-          icon: Icon(Icons.arrow_back_ios_new_rounded, color: textColor, size: 20),
-          onPressed: () {
-            if (_inPracticeMode) {
-              setState(() => _inPracticeMode = false);
-            } else {
-              Navigator.pop(context);
-            }
-          },
-        ),
+    return PopScope(
+      canPop: !_inPracticeMode,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop && _inPracticeMode) {
+          _handlePracticeBack();
+        }
+      },
+      child: Scaffold(
+        backgroundColor: bgColor,
+        appBar: AppBar(
+          backgroundColor: isDark ? const Color(0xFF0F172A) : Colors.white,
+          elevation: 0,
+          leading: IconButton(
+            icon: Icon(Icons.arrow_back_ios_new_rounded, color: textColor, size: 20),
+            onPressed: () {
+              if (_inPracticeMode) {
+                _handlePracticeBack();
+              } else {
+                Navigator.pop(context);
+              }
+            },
+          ),
         title: Text(
-          _inPracticeMode ? 'Kanji Practice' : widget.topic.title,
+          _inPracticeMode
+              ? (_isFullPracticeTest
+                  ? 'Full Practice (${_currentQuestions.length} Qs)'
+                  : 'Kanji Practice: ${widget.topic.kanji.isNotEmpty ? widget.topic.kanji[_selectedKanjiIndex].character : ""}')
+              : widget.topic.title,
           style: GoogleFonts.fredoka(
             fontSize: 18,
             fontWeight: FontWeight.bold,
@@ -251,7 +503,7 @@ class _KanjiLearnScreenState extends State<KanjiLearnScreen> with TickerProvider
             ),
             onPressed: () => theme.toggleVibrantText(),
           ),
-          if (!_inPracticeMode && widget.topic.kanji.isNotEmpty)
+          if (!_inPracticeMode && _totalQuestionsInTopic > 0)
             Padding(
               padding: const EdgeInsets.only(right: 12),
               child: ElevatedButton.icon(
@@ -262,9 +514,9 @@ class _KanjiLearnScreenState extends State<KanjiLearnScreen> with TickerProvider
                   padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
                   shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
                 ),
-                icon: const Icon(Icons.play_arrow_rounded, size: 18),
-                label: Text('Practice', style: GoogleFonts.fredoka(fontWeight: FontWeight.bold, fontSize: 13)),
-                onPressed: () => _startPracticeForKanji(0),
+                icon: const Icon(Icons.assignment_turned_in_rounded, size: 17),
+                label: Text('Full Test ($_totalQuestionsInTopic Qs)', style: GoogleFonts.fredoka(fontWeight: FontWeight.bold, fontSize: 13)),
+                onPressed: _checkAndStartFullPractice,
               ),
             ),
         ],
@@ -274,6 +526,7 @@ class _KanjiLearnScreenState extends State<KanjiLearnScreen> with TickerProvider
           : (_inPracticeMode
               ? _buildPracticeView(cardColor, textColor, subtextColor, isDark, tts, theme)
               : _buildKanjiStudyView(cardColor, textColor, subtextColor, isDark, tts, theme)),
+      ),
     );
   }
 
@@ -416,6 +669,86 @@ class _KanjiLearnScreenState extends State<KanjiLearnScreen> with TickerProvider
         ),
         const SizedBox(height: 18),
 
+        // Kanji Switcher Carousel (Horizontal List of all Kanji in lesson)
+        if (widget.topic.kanji.length > 1) ...[
+          SizedBox(
+            height: 68,
+            child: ListView.separated(
+              scrollDirection: Axis.horizontal,
+              itemCount: widget.topic.kanji.length,
+              separatorBuilder: (context, index) => const SizedBox(width: 8),
+              itemBuilder: (context, index) {
+                final k = widget.topic.kanji[index];
+                final isSelected = index == _selectedKanjiIndex;
+                final primaryReading = k.kunyomi.isNotEmpty
+                    ? k.kunyomi.first
+                    : (k.onyomi.isNotEmpty ? k.onyomi.first : '');
+
+                return InkWell(
+                  borderRadius: BorderRadius.circular(14),
+                  onTap: () {
+                    HapticFeedback.selectionClick();
+                    setState(() {
+                      _selectedKanjiIndex = index;
+                      _loadCurrentKanji();
+                    });
+                  },
+                  child: AnimatedContainer(
+                    duration: const Duration(milliseconds: 200),
+                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                    decoration: BoxDecoration(
+                      color: isSelected
+                          ? const Color(0xFF8B5CF6)
+                          : (isDark ? const Color(0xFF1E293B) : Colors.white),
+                      borderRadius: BorderRadius.circular(14),
+                      border: Border.all(
+                        color: isSelected
+                            ? const Color(0xFF8B5CF6)
+                            : (isDark ? Colors.white12 : Colors.grey.shade200),
+                        width: isSelected ? 2 : 1,
+                      ),
+                      boxShadow: isSelected
+                          ? [
+                              BoxShadow(
+                                color: const Color(0xFF8B5CF6).withValues(alpha: 0.35),
+                                blurRadius: 8,
+                                offset: const Offset(0, 3),
+                              )
+                            ]
+                          : [],
+                    ),
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Text(
+                          k.character.isNotEmpty ? k.character : 'Kanji ${index + 1}',
+                          style: TextStyle(
+                            fontSize: 18,
+                            fontWeight: FontWeight.bold,
+                            color: isSelected ? Colors.white : textColor,
+                          ),
+                        ),
+                        if (primaryReading.isNotEmpty) ...[
+                          const SizedBox(height: 2),
+                          Text(
+                            primaryReading,
+                            style: GoogleFonts.fredoka(
+                              fontSize: 10,
+                              fontWeight: FontWeight.w600,
+                              color: isSelected ? Colors.white.withValues(alpha: 0.85) : subtextColor,
+                            ),
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+          const SizedBox(height: 14),
+        ],
+
         // Interactive Kanji Canvas Card
         Container(
           padding: const EdgeInsets.all(18),
@@ -468,8 +801,11 @@ class _KanjiLearnScreenState extends State<KanjiLearnScreen> with TickerProvider
                         // Faint ghost character in background
                         Text(
                           item.character,
+                          textAlign: TextAlign.center,
                           style: TextStyle(
-                            fontSize: canvasSize * 0.72,
+                            fontSize: item.character.length > 2
+                                ? canvasSize * 0.35
+                                : (item.character.length == 2 ? canvasSize * 0.46 : canvasSize * 0.72),
                             fontWeight: FontWeight.normal,
                             color: isDark ? Colors.white.withValues(alpha: 0.12) : Colors.black.withValues(alpha: 0.08),
                           ),
@@ -626,6 +962,56 @@ class _KanjiLearnScreenState extends State<KanjiLearnScreen> with TickerProvider
                     ),
                   ],
                 ),
+              if (widget.topic.kanji.length > 1) ...[
+                const SizedBox(height: 12),
+                Divider(color: isDark ? Colors.white10 : Colors.grey.shade200, height: 1),
+                const SizedBox(height: 6),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    TextButton.icon(
+                      icon: const Icon(Icons.arrow_back_ios_rounded, size: 14),
+                      label: const Text('Previous'),
+                      style: TextButton.styleFrom(
+                        foregroundColor: _selectedKanjiIndex > 0 ? const Color(0xFF8B5CF6) : Colors.grey,
+                      ),
+                      onPressed: _selectedKanjiIndex > 0
+                          ? () {
+                              HapticFeedback.lightImpact();
+                              setState(() {
+                                _selectedKanjiIndex--;
+                                _loadCurrentKanji();
+                              });
+                            }
+                          : null,
+                    ),
+                    Text(
+                      '${_selectedKanjiIndex + 1} of ${widget.topic.kanji.length}',
+                      style: GoogleFonts.fredoka(
+                        fontSize: 12,
+                        fontWeight: FontWeight.bold,
+                        color: subtextColor,
+                      ),
+                    ),
+                    TextButton.icon(
+                      label: const Text('Next'),
+                      icon: const Icon(Icons.arrow_forward_ios_rounded, size: 14),
+                      style: TextButton.styleFrom(
+                        foregroundColor: _selectedKanjiIndex + 1 < widget.topic.kanji.length ? const Color(0xFF8B5CF6) : Colors.grey,
+                      ),
+                      onPressed: _selectedKanjiIndex + 1 < widget.topic.kanji.length
+                          ? () {
+                              HapticFeedback.lightImpact();
+                              setState(() {
+                                _selectedKanjiIndex++;
+                                _loadCurrentKanji();
+                              });
+                            }
+                          : null,
+                    ),
+                  ],
+                ),
+              ],
             ],
           ),
         ),
@@ -791,6 +1177,80 @@ class _KanjiLearnScreenState extends State<KanjiLearnScreen> with TickerProvider
             onPressed: () => _startPracticeForKanji(_selectedKanjiIndex),
           ),
         ),
+
+        // Full Lesson Practice Test Banner
+        if (_totalQuestionsInTopic > 0) ...[
+          const SizedBox(height: 16),
+          Container(
+            padding: const EdgeInsets.all(18),
+            decoration: BoxDecoration(
+              gradient: const LinearGradient(
+                colors: [Color(0xFF7C3AED), Color(0xFF8B5CF6)],
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+              ),
+              borderRadius: BorderRadius.circular(20),
+              boxShadow: [
+                BoxShadow(
+                  color: const Color(0xFF8B5CF6).withValues(alpha: 0.3),
+                  blurRadius: 10,
+                  offset: const Offset(0, 4),
+                ),
+              ],
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Row(
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.all(10),
+                      decoration: BoxDecoration(
+                        color: Colors.white.withValues(alpha: 0.2),
+                        shape: BoxShape.circle,
+                      ),
+                      child: const Icon(Icons.assignment_turned_in_rounded, color: Colors.white, size: 24),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'Full Lesson Practice Test',
+                            style: GoogleFonts.fredoka(fontSize: 17, fontWeight: FontWeight.bold, color: Colors.white),
+                          ),
+                          const SizedBox(height: 2),
+                          Text(
+                            'Practice all $_totalQuestionsInTopic questions across all ${widget.topic.kanji.length} kanji in this lesson.',
+                            style: GoogleFonts.fredoka(fontSize: 12, color: Colors.white.withValues(alpha: 0.9)),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 14),
+                SizedBox(
+                  height: 48,
+                  child: ElevatedButton(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.white,
+                      foregroundColor: const Color(0xFF7C3AED),
+                      elevation: 0,
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                    ),
+                    onPressed: _checkAndStartFullPractice,
+                    child: Text(
+                      'Start Full Practice Test ($_totalQuestionsInTopic Qs) →',
+                      style: GoogleFonts.fredoka(fontSize: 15, fontWeight: FontWeight.bold),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
         const SizedBox(height: 24),
       ],
     );
@@ -800,7 +1260,19 @@ class _KanjiLearnScreenState extends State<KanjiLearnScreen> with TickerProvider
     final isSelected = _canvasMode == mode;
     return InkWell(
       borderRadius: BorderRadius.circular(10),
-      onTap: () => setState(() => _canvasMode = mode),
+      onTap: () {
+        setState(() => _canvasMode = mode);
+        try {
+          final analytics = Provider.of<AnalyticsService>(context, listen: false);
+          final char = widget.topic.kanji.isNotEmpty && _selectedKanjiIndex < widget.topic.kanji.length
+              ? widget.topic.kanji[_selectedKanjiIndex].character
+              : '';
+          analytics.logKanjiCanvasUsed(
+            character: char,
+            mode: mode == 0 ? 'draw' : 'animation',
+          );
+        } catch (_) {}
+      },
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
         decoration: BoxDecoration(
@@ -876,22 +1348,72 @@ class _KanjiLearnScreenState extends State<KanjiLearnScreen> with TickerProvider
               ),
               const SizedBox(height: 8),
               Text(
-                'Excellent progress on ${widget.topic.kanji[_selectedKanjiIndex].character}!',
+                _isFullPracticeTest
+                    ? 'Amazing! You finished all ${_currentQuestions.length} questions across all kanji in this lesson!'
+                    : 'Excellent progress on ${widget.topic.kanji.isNotEmpty ? widget.topic.kanji[_selectedKanjiIndex].character : ""}!',
                 textAlign: TextAlign.center,
                 style: GoogleFonts.fredoka(fontSize: 13, color: subtextColor),
               ),
               const SizedBox(height: 24),
+
+              if (!_isFullPracticeTest && _totalQuestionsInTopic > _currentQuestions.length) ...[
+                SizedBox(
+                  width: 260,
+                  height: 50,
+                  child: ElevatedButton.icon(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF8B5CF6),
+                      foregroundColor: Colors.white,
+                      elevation: 2,
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                    ),
+                    icon: const Icon(Icons.assignment_turned_in_rounded, size: 20),
+                    label: Text(
+                      'Take Full Lesson Test ($_totalQuestionsInTopic Qs)',
+                      style: GoogleFonts.fredoka(fontWeight: FontWeight.bold, fontSize: 14),
+                    ),
+                    onPressed: _checkAndStartFullPractice,
+                  ),
+                ),
+                const SizedBox(height: 12),
+              ],
+
               SizedBox(
-                width: 240,
+                width: 260,
                 height: 48,
-                child: ElevatedButton(
+                child: ElevatedButton.icon(
                   style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF8B5CF6),
+                    backgroundColor: const Color(0xFF7C3AED),
                     foregroundColor: Colors.white,
+                    elevation: 1,
                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
                   ),
+                  icon: const Icon(Icons.refresh_rounded, size: 20),
+                  label: Text(
+                    _isFullPracticeTest ? 'Retake Full Practice' : 'Retake Kanji Practice',
+                    style: GoogleFonts.fredoka(fontWeight: FontWeight.bold, fontSize: 14),
+                  ),
+                  onPressed: () {
+                    if (_isFullPracticeTest) {
+                      _startFullPracticeTest();
+                    } else {
+                      _startPracticeForKanji(_selectedKanjiIndex);
+                    }
+                  },
+                ),
+              ),
+              const SizedBox(height: 12),
+
+              SizedBox(
+                width: 260,
+                height: 48,
+                child: OutlinedButton(
+                  style: OutlinedButton.styleFrom(
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                    side: const BorderSide(color: Color(0xFF8B5CF6)),
+                  ),
                   onPressed: () => setState(() => _inPracticeMode = false),
-                  child: Text('Back to Kanji Drawing', style: GoogleFonts.fredoka(fontWeight: FontWeight.bold)),
+                  child: Text('Back to Kanji Drawing', style: GoogleFonts.fredoka(fontWeight: FontWeight.bold, color: const Color(0xFF8B5CF6))),
                 ),
               ),
             ],
@@ -902,6 +1424,17 @@ class _KanjiLearnScreenState extends State<KanjiLearnScreen> with TickerProvider
 
     final question = _currentQuestions[_currentQuestionIndex];
     final progress = (_currentQuestionIndex + 1) / _currentQuestions.length;
+
+    KanjiItem? currentKanji;
+    for (final k in widget.topic.kanji) {
+      if (k.questions.any((q) => q.id.toString() == question.id.toString())) {
+        currentKanji = k;
+        break;
+      }
+    }
+    if (currentKanji == null && widget.topic.kanji.isNotEmpty) {
+      currentKanji = widget.topic.kanji[_selectedKanjiIndex];
+    }
 
     return ListView(
       padding: const EdgeInsets.all(16),
@@ -954,31 +1487,99 @@ class _KanjiLearnScreenState extends State<KanjiLearnScreen> with TickerProvider
               Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
-                  Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                    decoration: BoxDecoration(
-                      color: const Color(0xFF8B5CF6).withValues(alpha: 0.15),
-                      borderRadius: BorderRadius.circular(6),
-                    ),
-                    child: Text(
-                      question.type,
-                      style: GoogleFonts.fredoka(fontSize: 11, fontWeight: FontWeight.bold, color: const Color(0xFF8B5CF6)),
-                    ),
+                  Row(
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF8B5CF6).withValues(alpha: 0.15),
+                          borderRadius: BorderRadius.circular(6),
+                        ),
+                        child: Text(
+                          question.type,
+                          style: GoogleFonts.fredoka(fontSize: 11, fontWeight: FontWeight.bold, color: const Color(0xFF8B5CF6)),
+                        ),
+                      ),
+                      if (currentKanji != null) ...[
+                        const SizedBox(width: 8),
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                          decoration: BoxDecoration(
+                            color: isDark ? Colors.white12 : Colors.grey.shade100,
+                            borderRadius: BorderRadius.circular(6),
+                          ),
+                          child: Text(
+                            '${currentKanji.character} (${currentKanji.meanings.take(2).join(', ')})',
+                            style: GoogleFonts.fredoka(
+                              fontSize: 12,
+                              fontWeight: FontWeight.bold,
+                              color: textColor,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ],
                   ),
-                  if (question.japanese.isNotEmpty)
-                    IconButton(
-                      icon: const Icon(Icons.volume_up_rounded, color: Color(0xFF8B5CF6)),
-                      tooltip: 'Speak sentence',
-                      onPressed: () {
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      IconButton(
+                        icon: const Icon(Icons.flag_outlined, color: Color(0xFFEF4444), size: 20),
+                        tooltip: 'Report question mistake',
+                        onPressed: () {
+                          QuestionReportDialog.show(
+                            context: context,
+                            questionId: question.id,
+                            topicId: widget.topic.id,
+                            category: 'kanji',
+                            level: widget.topic.jlpt,
+                            questionText: question.japanese.isNotEmpty
+                                ? (question.completedSentence.isNotEmpty ? question.completedSentence : question.japanese)
+                                : question.question,
+                            options: question.options,
+                            correctOption: question.correctOption,
+                          );
+                        },
+                      ),
+                      IconButton(
+                        icon: const Icon(Icons.copy_rounded, color: Color(0xFF8B5CF6), size: 20),
+                        tooltip: 'Copy question sentence',
+                        onPressed: () {
+                          final text = question.japanese.isNotEmpty
+                              ? (_isAnswerSubmitted && question.completedSentence.isNotEmpty ? question.completedSentence : question.japanese)
+                              : question.question;
+                          ClipboardHelper.copy(context, text, label: 'Question sentence copied');
+                        },
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
+
+              // Centered TTS Speaker Button
+              if (question.japanese.isNotEmpty) ...[
+                Center(
+                  child: Material(
+                    color: isDark ? Colors.white10 : const Color(0xFF8B5CF6).withValues(alpha: 0.1),
+                    shape: const CircleBorder(),
+                    child: InkWell(
+                      customBorder: const CircleBorder(),
+                      onTap: () {
                         final text = _isAnswerSubmitted && question.completedSentence.isNotEmpty
                             ? question.completedSentence
                             : question.japanese.replaceAll('___', '');
                         tts.speakJapanese(text);
                       },
+                      child: const Padding(
+                        padding: EdgeInsets.all(10),
+                        child: Icon(Icons.volume_up_rounded, color: Color(0xFF8B5CF6), size: 26),
+                      ),
                     ),
-                ],
-              ),
-              const SizedBox(height: 10),
+                  ),
+                ),
+                const SizedBox(height: 10),
+              ],
 
               if (question.japanese.isNotEmpty) ...[
                 GrammarJapaneseSentenceWidget(
@@ -1027,6 +1628,9 @@ class _KanjiLearnScreenState extends State<KanjiLearnScreen> with TickerProvider
             child: InkWell(
               borderRadius: BorderRadius.circular(16),
               onTap: _isAnswerSubmitted ? null : () => _submitAnswer(optKey),
+              onLongPress: () {
+                ClipboardHelper.copy(context, optLabel, label: 'Option "$optLabel" copied');
+              },
               child: Container(
                 padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
                 decoration: BoxDecoration(
@@ -1068,9 +1672,17 @@ class _KanjiLearnScreenState extends State<KanjiLearnScreen> with TickerProvider
                       ),
                     ),
                     if (_isAnswerSubmitted && optKey == question.correctOption)
-                      const Icon(Icons.check_circle_rounded, color: Color(0xFF10B981), size: 22),
-                    if (_isAnswerSubmitted && optKey == _selectedOption && optKey != question.correctOption)
-                      const Icon(Icons.cancel_rounded, color: Color(0xFFEF4444), size: 22),
+                      const Icon(Icons.check_circle_rounded, color: Color(0xFF10B981), size: 22)
+                    else if (_isAnswerSubmitted && optKey == _selectedOption && optKey != question.correctOption)
+                      const Icon(Icons.cancel_rounded, color: Color(0xFFEF4444), size: 22)
+                    else
+                      IconButton(
+                        icon: Icon(Icons.copy_rounded, size: 16, color: isDark ? Colors.white38 : Colors.grey.shade400),
+                        tooltip: 'Copy option',
+                        onPressed: () {
+                          ClipboardHelper.copy(context, optLabel, label: 'Option "$optLabel" copied');
+                        },
+                      ),
                   ],
                 ),
               ),

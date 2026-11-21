@@ -2,13 +2,17 @@ import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:provider/provider.dart';
 import '../../models/vocab_model.dart';
+import '../../services/auth_service.dart';
 import '../../services/database_service.dart';
 import '../../services/theme_service.dart';
 import '../../services/tts_service.dart';
 import '../../services/ad_service.dart';
+import '../../services/analytics_service.dart';
 import '../../services/iap_service.dart';
 import '../../widgets/grammar_japanese_sentence_widget.dart';
 import '../../widgets/app_native_ad_widget.dart';
+import '../../widgets/clipboard_helper.dart';
+import '../../widgets/question_report_dialog.dart';
 import '../../widgets/premium_subscription_dialog.dart';
 
 class VocabLearnScreen extends StatefulWidget {
@@ -22,6 +26,7 @@ class VocabLearnScreen extends StatefulWidget {
 
 class _VocabLearnScreenState extends State<VocabLearnScreen> {
   bool _inPracticeMode = false;
+  bool _isFullPracticeTest = false;
   int _selectedWordIndex = 0;
   late List<VocabularyQuestion> _currentQuestions;
   int _currentQuestionIndex = 0;
@@ -29,23 +34,211 @@ class _VocabLearnScreenState extends State<VocabLearnScreen> {
   bool _isAnswerSubmitted = false;
   int _correctCount = 0;
 
+  int get _totalQuestionsInTopic {
+    return widget.topic.vocabulary.fold<int>(0, (sum, item) => sum + item.questions.length);
+  }
+
   @override
   void initState() {
     super.initState();
     _loadQuestionsForSelectedWord();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        final analytics = Provider.of<AnalyticsService>(context, listen: false);
+        analytics.logLessonStarted(
+          lessonId: widget.topic.id,
+          level: widget.topic.jlpt,
+          category: 'vocab',
+          title: widget.topic.title,
+        );
+      }
+    });
   }
 
   void _loadQuestionsForSelectedWord() {
     if (widget.topic.vocabulary.isNotEmpty) {
       final word = widget.topic.vocabulary[_selectedWordIndex];
-      _currentQuestions = List.from(word.questions);
+      _currentQuestions = List<VocabularyQuestion>.from(word.questions)..shuffle();
     } else {
       _currentQuestions = [];
     }
   }
 
+  Future<bool> _handlePracticeBack() async {
+    if (!_inPracticeMode || _currentQuestionIndex >= _currentQuestions.length) {
+      return true;
+    }
+
+    final db = Provider.of<DatabaseService>(context, listen: false);
+
+    // If user answered at least 3 questions in full test, mark lesson as complete so it adds to SRS review
+    if (_currentQuestionIndex >= 2 || _correctCount >= 3) {
+      await db.markVocabCompleted(widget.topic.id);
+    }
+
+    // Save current progress before asking
+    await db.savePracticeProgress(
+      topicId: widget.topic.id,
+      category: 'vocab',
+      currentIndex: _currentQuestionIndex,
+      correctCount: _correctCount,
+      questionIds: _currentQuestions.map((q) => q.id).toList(),
+      isFullPractice: _isFullPracticeTest,
+    );
+
+    if (!mounted) return false;
+
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final shouldExit = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: isDark ? const Color(0xFF1E293B) : Colors.white,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: Row(
+          children: [
+            const Icon(Icons.pause_circle_filled_rounded, color: Color(0xFF06B6D4), size: 26),
+            const SizedBox(width: 10),
+            Text(
+              'Pause Practice?',
+              style: GoogleFonts.fredoka(fontWeight: FontWeight.bold, fontSize: 18),
+            ),
+          ],
+        ),
+        content: Text(
+          'Your progress on Question ${_currentQuestionIndex + 1} of ${_currentQuestions.length} has been saved.\n\n${(_currentQuestionIndex >= 2 || _correctCount >= 3) ? "✅ Lesson marked completed (3+ questions answered) and added to SRS review!\n\n" : ""}Would you like to exit to study mode or keep practicing?',
+          style: GoogleFonts.fredoka(fontSize: 14),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: Text('Resume Practice', style: GoogleFonts.fredoka(fontWeight: FontWeight.bold, color: const Color(0xFF06B6D4))),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFFEF4444),
+              foregroundColor: Colors.white,
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+            ),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: Text('Save & Exit', style: GoogleFonts.fredoka(fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
+    );
+
+    if (shouldExit == true) {
+      setState(() => _inPracticeMode = false);
+      return false;
+    }
+    return false;
+  }
+
+  Future<void> _checkAndStartFullPractice() async {
+    final db = Provider.of<DatabaseService>(context, listen: false);
+    final saved = await db.getPracticeProgress(widget.topic.id);
+
+    if (saved != null && saved.currentIndex > 0 && saved.currentIndex < _totalQuestionsInTopic) {
+      if (!mounted) return;
+      final isDark = Theme.of(context).brightness == Brightness.dark;
+
+      final choice = await showDialog<String>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          backgroundColor: isDark ? const Color(0xFF1E293B) : Colors.white,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+          title: Row(
+            children: [
+              const Icon(Icons.history_rounded, color: Color(0xFF06B6D4), size: 26),
+              const SizedBox(width: 10),
+              Text(
+                'Resume Practice?',
+                style: GoogleFonts.fredoka(fontWeight: FontWeight.bold, fontSize: 18),
+              ),
+            ],
+          ),
+          content: Text(
+            'You previously stopped at Question ${saved.currentIndex + 1} of ${saved.questionIds.length} (${saved.correctCount} correct).\n\nWould you like to continue from where you left off or start a full random test?',
+            style: GoogleFonts.fredoka(fontSize: 14),
+          ),
+          actions: [
+            OutlinedButton(
+              style: OutlinedButton.styleFrom(
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+              ),
+              onPressed: () => Navigator.pop(ctx, 'fresh'),
+              child: Text('Start Fresh (Random)', style: GoogleFonts.fredoka(fontWeight: FontWeight.bold)),
+            ),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFF06B6D4),
+                foregroundColor: Colors.white,
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+              ),
+              onPressed: () => Navigator.pop(ctx, 'resume'),
+              child: Text('Resume (Q ${saved.currentIndex + 1})', style: GoogleFonts.fredoka(fontWeight: FontWeight.bold)),
+            ),
+          ],
+        ),
+      );
+
+      if (choice == 'resume') {
+        final allQ = <VocabularyQuestion>[];
+        for (final word in widget.topic.vocabulary) {
+          allQ.addAll(word.questions);
+        }
+        final qMap = {for (var q in allQ) q.id.toString(): q};
+        final orderedQuestions = <VocabularyQuestion>[];
+        for (var id in saved.questionIds) {
+          if (qMap.containsKey(id)) {
+            orderedQuestions.add(qMap[id]!);
+          }
+        }
+        for (var q in allQ) {
+          if (!orderedQuestions.contains(q)) {
+            orderedQuestions.add(q);
+          }
+        }
+
+        setState(() {
+          _isFullPracticeTest = saved.isFullPractice;
+          _currentQuestions = orderedQuestions;
+          _currentQuestionIndex = saved.currentIndex.clamp(0, orderedQuestions.length - 1);
+          _correctCount = saved.correctCount;
+          _selectedOption = null;
+          _isAnswerSubmitted = false;
+          _inPracticeMode = true;
+        });
+        return;
+      } else if (choice == 'fresh') {
+        await db.clearPracticeProgress(widget.topic.id);
+      } else {
+        return;
+      }
+    }
+
+    _startFullPracticeTest();
+  }
+
+  void _startFullPracticeTest() {
+    final allQuestions = <VocabularyQuestion>[];
+    for (final word in widget.topic.vocabulary) {
+      allQuestions.addAll(word.questions);
+    }
+    allQuestions.shuffle();
+    setState(() {
+      _isFullPracticeTest = true;
+      _currentQuestions = allQuestions;
+      _inPracticeMode = true;
+      _currentQuestionIndex = 0;
+      _selectedOption = null;
+      _isAnswerSubmitted = false;
+      _correctCount = 0;
+    });
+  }
+
   void _startPracticeForWord(int wordIndex) {
     setState(() {
+      _isFullPracticeTest = false;
       _selectedWordIndex = wordIndex;
       _loadQuestionsForSelectedWord();
       _inPracticeMode = true;
@@ -67,6 +260,36 @@ class _VocabLearnScreenState extends State<VocabLearnScreen> {
       _isAnswerSubmitted = true;
       if (isCorrect) _correctCount++;
     });
+
+    // Log Question Answered Analytics
+    try {
+      final analytics = Provider.of<AnalyticsService>(context, listen: false);
+      analytics.logQuestionAnswered(
+        lessonId: widget.topic.id,
+        category: 'vocab',
+        questionIndex: _currentQuestionIndex,
+        questionId: question.id,
+        isCorrect: isCorrect,
+        selectedOption: optionKey,
+        correctOption: question.correctOption,
+      );
+    } catch (_) {}
+
+    // Save progress after answering
+    final db = Provider.of<DatabaseService>(context, listen: false);
+    db.savePracticeProgress(
+      topicId: widget.topic.id,
+      category: 'vocab',
+      currentIndex: _currentQuestionIndex,
+      correctCount: _correctCount,
+      questionIds: _currentQuestions.map((q) => q.id).toList(),
+      isFullPractice: _isFullPracticeTest,
+    );
+
+    // If user answered at least 3 questions in full practice test, mark Lesson as Complete so it adds to SRS review
+    if (_isFullPracticeTest && (_currentQuestionIndex >= 2 || _correctCount >= 3)) {
+      db.markVocabCompleted(widget.topic.id);
+    }
 
     // Speak full sentence audio on correct or wrong
     try {
@@ -99,9 +322,23 @@ class _VocabLearnScreenState extends State<VocabLearnScreen> {
         _currentQuestionIndex++; // Points to completed
       });
 
-      // Mark vocab topic as completed
+      // Mark vocab topic as completed & clear in-progress state
       final db = Provider.of<DatabaseService>(context, listen: false);
       db.markVocabCompleted(widget.topic.id);
+      db.clearPracticeProgress(widget.topic.id);
+
+      // Log Lesson Completed Analytics
+      try {
+        final analytics = Provider.of<AnalyticsService>(context, listen: false);
+        analytics.logLessonCompleted(
+          lessonId: widget.topic.id,
+          level: widget.topic.jlpt,
+          category: 'vocab',
+          score: _correctCount,
+          totalQuestions: _currentQuestions.length,
+          title: widget.topic.title,
+        );
+      } catch (_) {}
 
       // Trigger interstitial ad between lessons
       final adService = Provider.of<AdService>(context, listen: false);
@@ -116,92 +353,106 @@ class _VocabLearnScreenState extends State<VocabLearnScreen> {
     final tts = Provider.of<TtsService>(context);
     final db = Provider.of<DatabaseService>(context);
     final iap = Provider.of<IapService>(context);
+    final auth = Provider.of<AuthService>(context);
     final isDark = theme.isDarkMode;
+    final isAdmin = auth.isAdmin;
 
     final bgColor = isDark ? const Color(0xFF0B1120) : const Color(0xFFF8FAFC);
     final cardColor = isDark ? const Color(0xFF1E293B) : Colors.white;
     final textColor = isDark ? Colors.white : const Color(0xFF0F172A);
     final subtextColor = isDark ? Colors.white70 : const Color(0xFF64748B);
 
-    final isLocked = db.isVocabTopicLocked(widget.topic.id, iap.isPremium);
+    final isLocked = db.isVocabTopicLocked(widget.topic.id, iap.isPremium, isAdmin: isAdmin);
 
-    return Scaffold(
-      backgroundColor: bgColor,
-      appBar: AppBar(
-        backgroundColor: isDark ? const Color(0xFF0F172A) : Colors.white,
-        elevation: 0,
-        leading: IconButton(
-          icon: Icon(Icons.arrow_back_ios_new_rounded, color: textColor, size: 20),
-          onPressed: () {
-            if (_inPracticeMode) {
-              setState(() => _inPracticeMode = false);
-            } else {
-              Navigator.pop(context);
-            }
-          },
-        ),
-        title: Text(
-          _inPracticeMode ? 'Vocab Practice' : widget.topic.title,
-          style: GoogleFonts.fredoka(
-            fontSize: 18,
-            fontWeight: FontWeight.bold,
-            color: textColor,
+    return PopScope(
+      canPop: !_inPracticeMode,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop && _inPracticeMode) {
+          _handlePracticeBack();
+        }
+      },
+      child: Scaffold(
+        backgroundColor: bgColor,
+        appBar: AppBar(
+          backgroundColor: isDark ? const Color(0xFF0F172A) : Colors.white,
+          elevation: 0,
+          leading: IconButton(
+            icon: Icon(Icons.arrow_back_ios_new_rounded, color: textColor, size: 20),
+            onPressed: () {
+              if (_inPracticeMode) {
+                _handlePracticeBack();
+              } else {
+                Navigator.pop(context);
+              }
+            },
           ),
-        ),
-        actions: [
-          // Real-time Furigana / Romaji Toggle
-          IconButton(
-            tooltip: theme.showFurigana ? 'Furigana/Romaji: ON' : 'Furigana/Romaji: OFF',
-            icon: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-              decoration: BoxDecoration(
-                color: theme.showFurigana ? const Color(0xFF6366F1) : (isDark ? Colors.white12 : Colors.grey.shade200),
-                borderRadius: BorderRadius.circular(6),
-              ),
-              child: Text(
-                'ふ',
-                style: TextStyle(
-                  fontSize: 13,
-                  fontWeight: FontWeight.bold,
-                  color: theme.showFurigana ? Colors.white : subtextColor,
+          title: Text(
+            _inPracticeMode
+                ? (_isFullPracticeTest
+                    ? 'Full Practice (${_currentQuestions.length} Qs)'
+                    : 'Vocab Practice: ${widget.topic.vocabulary.isNotEmpty ? widget.topic.vocabulary[_selectedWordIndex].word : ""}')
+                : widget.topic.title,
+            style: GoogleFonts.fredoka(
+              fontSize: 18,
+              fontWeight: FontWeight.bold,
+              color: textColor,
+            ),
+          ),
+          actions: [
+            // Real-time Furigana / Romaji Toggle
+            IconButton(
+              tooltip: theme.showFurigana ? 'Furigana/Romaji: ON' : 'Furigana/Romaji: OFF',
+              icon: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                decoration: BoxDecoration(
+                  color: theme.showFurigana ? const Color(0xFF6366F1) : (isDark ? Colors.white12 : Colors.grey.shade200),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: Text(
+                  'ふ',
+                  style: TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.bold,
+                    color: theme.showFurigana ? Colors.white : subtextColor,
+                  ),
                 ),
               ),
+              onPressed: () => theme.toggleFurigana(),
             ),
-            onPressed: () => theme.toggleFurigana(),
-          ),
-          // Real-time Colorful Words Toggle
-          IconButton(
-            tooltip: theme.isVibrantText ? 'Colorful Words: ON' : 'Colorful Words: OFF',
-            icon: Icon(
-              Icons.palette_rounded,
-              color: theme.isVibrantText ? const Color(0xFFEC4899) : subtextColor,
-              size: 20,
-            ),
-            onPressed: () => theme.toggleVibrantText(),
-          ),
-          if (!_inPracticeMode && widget.topic.vocabulary.isNotEmpty)
-            Padding(
-              padding: const EdgeInsets.only(right: 12),
-              child: ElevatedButton.icon(
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: const Color(0xFF6366F1),
-                  foregroundColor: Colors.white,
-                  elevation: 0,
-                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                ),
-                icon: const Icon(Icons.play_arrow_rounded, size: 18),
-                label: Text('Practice', style: GoogleFonts.fredoka(fontWeight: FontWeight.bold, fontSize: 13)),
-                onPressed: () => _startPracticeForWord(0),
+            // Real-time Colorful Words Toggle
+            IconButton(
+              tooltip: theme.isVibrantText ? 'Colorful Words: ON' : 'Colorful Words: OFF',
+              icon: Icon(
+                Icons.palette_rounded,
+                color: theme.isVibrantText ? const Color(0xFFEC4899) : subtextColor,
+                size: 20,
               ),
+              onPressed: () => theme.toggleVibrantText(),
             ),
-        ],
+            if (!_inPracticeMode && _totalQuestionsInTopic > 0)
+              Padding(
+                padding: const EdgeInsets.only(right: 12),
+                child: ElevatedButton.icon(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF06B6D4),
+                    foregroundColor: Colors.white,
+                    elevation: 0,
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                  ),
+                  icon: const Icon(Icons.assignment_turned_in_rounded, size: 17),
+                  label: Text('Full Test ($_totalQuestionsInTopic Qs)', style: GoogleFonts.fredoka(fontWeight: FontWeight.bold, fontSize: 13)),
+                  onPressed: _checkAndStartFullPractice,
+                ),
+              ),
+          ],
+        ),
+        body: isLocked
+            ? _buildLockedView(context, isDark, textColor, subtextColor)
+            : (_inPracticeMode
+                ? _buildPracticeView(cardColor, textColor, subtextColor, isDark, tts, theme)
+                : _buildWordListView(cardColor, textColor, subtextColor, isDark, tts, theme)),
       ),
-      body: isLocked
-          ? _buildLockedView(context, isDark, textColor, subtextColor)
-          : (_inPracticeMode
-              ? _buildPracticeView(cardColor, textColor, subtextColor, isDark, tts, theme)
-              : _buildWordListView(cardColor, textColor, subtextColor, isDark, tts, theme)),
     );
   }
 
@@ -517,6 +768,81 @@ class _VocabLearnScreenState extends State<VocabLearnScreen> {
             ),
           );
         }),
+
+        // Full Practice Test Banner at bottom
+        if (_totalQuestionsInTopic > 0) ...[
+          const SizedBox(height: 12),
+          Container(
+            padding: const EdgeInsets.all(18),
+            decoration: BoxDecoration(
+              gradient: const LinearGradient(
+                colors: [Color(0xFF0891B2), Color(0xFF06B6D4)],
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+              ),
+              borderRadius: BorderRadius.circular(20),
+              boxShadow: [
+                BoxShadow(
+                  color: const Color(0xFF06B6D4).withValues(alpha: 0.3),
+                  blurRadius: 10,
+                  offset: const Offset(0, 4),
+                ),
+              ],
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Row(
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.all(10),
+                      decoration: BoxDecoration(
+                        color: Colors.white.withValues(alpha: 0.2),
+                        shape: BoxShape.circle,
+                      ),
+                      child: const Icon(Icons.assignment_turned_in_rounded, color: Colors.white, size: 24),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'Full Lesson Practice Test',
+                            style: GoogleFonts.fredoka(fontSize: 17, fontWeight: FontWeight.bold, color: Colors.white),
+                          ),
+                          const SizedBox(height: 2),
+                          Text(
+                            'Practice all $_totalQuestionsInTopic questions across all ${widget.topic.vocabulary.length} words in this lesson.',
+                            style: GoogleFonts.fredoka(fontSize: 12, color: Colors.white.withValues(alpha: 0.9)),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 14),
+                SizedBox(
+                  height: 48,
+                  child: ElevatedButton(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.white,
+                      foregroundColor: const Color(0xFF0891B2),
+                      elevation: 0,
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                    ),
+                    onPressed: _checkAndStartFullPractice,
+                    child: Text(
+                      'Start Full Practice Test ($_totalQuestionsInTopic Qs) →',
+                      style: GoogleFonts.fredoka(fontSize: 15, fontWeight: FontWeight.bold),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 24),
+        ],
       ],
     );
   }
@@ -558,22 +884,72 @@ class _VocabLearnScreenState extends State<VocabLearnScreen> {
               ),
               const SizedBox(height: 8),
               Text(
-                'Great job practicing ${widget.topic.vocabulary[_selectedWordIndex].word}!',
+                _isFullPracticeTest
+                    ? 'Amazing! You finished all ${_currentQuestions.length} questions for this lesson!'
+                    : 'Great job practicing ${widget.topic.vocabulary.isNotEmpty ? widget.topic.vocabulary[_selectedWordIndex].word : ""}!',
                 textAlign: TextAlign.center,
                 style: GoogleFonts.fredoka(fontSize: 13, color: subtextColor),
               ),
               const SizedBox(height: 24),
+
+              if (!_isFullPracticeTest && _totalQuestionsInTopic > _currentQuestions.length) ...[
+                SizedBox(
+                  width: 260,
+                  height: 50,
+                  child: ElevatedButton.icon(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF06B6D4),
+                      foregroundColor: Colors.white,
+                      elevation: 2,
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                    ),
+                    icon: const Icon(Icons.assignment_turned_in_rounded, size: 20),
+                    label: Text(
+                      'Take Full Lesson Test ($_totalQuestionsInTopic Qs)',
+                      style: GoogleFonts.fredoka(fontWeight: FontWeight.bold, fontSize: 14),
+                    ),
+                    onPressed: _checkAndStartFullPractice,
+                  ),
+                ),
+                const SizedBox(height: 12),
+              ],
+
               SizedBox(
-                width: 240,
+                width: 260,
                 height: 48,
-                child: ElevatedButton(
+                child: ElevatedButton.icon(
                   style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF06B6D4),
+                    backgroundColor: const Color(0xFF0891B2),
                     foregroundColor: Colors.white,
+                    elevation: 1,
                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
                   ),
+                  icon: const Icon(Icons.refresh_rounded, size: 20),
+                  label: Text(
+                    _isFullPracticeTest ? 'Retake Full Practice' : 'Retake Word Practice',
+                    style: GoogleFonts.fredoka(fontWeight: FontWeight.bold, fontSize: 14),
+                  ),
+                  onPressed: () {
+                    if (_isFullPracticeTest) {
+                      _startFullPracticeTest();
+                    } else {
+                      _startPracticeForWord(_selectedWordIndex);
+                    }
+                  },
+                ),
+              ),
+              const SizedBox(height: 12),
+
+              SizedBox(
+                width: 260,
+                height: 48,
+                child: OutlinedButton(
+                  style: OutlinedButton.styleFrom(
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                    side: const BorderSide(color: Color(0xFF06B6D4)),
+                  ),
                   onPressed: () => setState(() => _inPracticeMode = false),
-                  child: Text('Back to Word Guide', style: GoogleFonts.fredoka(fontWeight: FontWeight.bold)),
+                  child: Text('Back to Word Guide', style: GoogleFonts.fredoka(fontWeight: FontWeight.bold, color: const Color(0xFF06B6D4))),
                 ),
               ),
             ],
@@ -584,6 +960,17 @@ class _VocabLearnScreenState extends State<VocabLearnScreen> {
 
     final question = _currentQuestions[_currentQuestionIndex];
     final progress = (_currentQuestionIndex + 1) / _currentQuestions.length;
+
+    VocabularyItem? currentWord;
+    for (final w in widget.topic.vocabulary) {
+      if (w.questions.any((q) => q.id.toString() == question.id.toString())) {
+        currentWord = w;
+        break;
+      }
+    }
+    if (currentWord == null && widget.topic.vocabulary.isNotEmpty) {
+      currentWord = widget.topic.vocabulary[_selectedWordIndex];
+    }
 
     return ListView(
       padding: const EdgeInsets.all(16),
@@ -636,35 +1023,103 @@ class _VocabLearnScreenState extends State<VocabLearnScreen> {
               Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
-                  Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                    decoration: BoxDecoration(
-                      color: const Color(0xFF06B6D4).withValues(alpha: 0.15),
-                      borderRadius: BorderRadius.circular(6),
-                    ),
-                    child: Text(
-                      question.type,
-                      style: GoogleFonts.fredoka(
-                        fontSize: 11,
-                        fontWeight: FontWeight.bold,
-                        color: const Color(0xFF06B6D4),
+                  Row(
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF06B6D4).withValues(alpha: 0.15),
+                          borderRadius: BorderRadius.circular(6),
+                        ),
+                        child: Text(
+                          question.type,
+                          style: GoogleFonts.fredoka(
+                            fontSize: 11,
+                            fontWeight: FontWeight.bold,
+                            color: const Color(0xFF06B6D4),
+                          ),
+                        ),
                       ),
-                    ),
+                      if (currentWord != null) ...[
+                        const SizedBox(width: 8),
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                          decoration: BoxDecoration(
+                            color: isDark ? Colors.white12 : Colors.grey.shade100,
+                            borderRadius: BorderRadius.circular(6),
+                          ),
+                          child: Text(
+                            '${currentWord.word} (${currentWord.reading})',
+                            style: GoogleFonts.fredoka(
+                              fontSize: 12,
+                              fontWeight: FontWeight.bold,
+                              color: textColor,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ],
                   ),
-                  if (question.japanese.isNotEmpty)
-                    IconButton(
-                      icon: const Icon(Icons.volume_up_rounded, color: Color(0xFF06B6D4)),
-                      tooltip: 'Speak sentence',
-                      onPressed: () {
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      IconButton(
+                        icon: const Icon(Icons.flag_outlined, color: Color(0xFFEF4444), size: 20),
+                        tooltip: 'Report question mistake',
+                        onPressed: () {
+                          QuestionReportDialog.show(
+                            context: context,
+                            questionId: question.id,
+                            topicId: widget.topic.id,
+                            category: 'vocab',
+                            level: widget.topic.jlpt,
+                            questionText: question.japanese.isNotEmpty
+                                ? (question.completedSentence.isNotEmpty ? question.completedSentence : question.japanese)
+                                : question.question,
+                            options: question.options,
+                            correctOption: question.correctOption,
+                          );
+                        },
+                      ),
+                      IconButton(
+                        icon: const Icon(Icons.copy_rounded, color: Color(0xFF06B6D4), size: 20),
+                        tooltip: 'Copy question sentence',
+                        onPressed: () {
+                          final text = question.japanese.isNotEmpty
+                              ? (_isAnswerSubmitted && question.completedSentence.isNotEmpty ? question.completedSentence : question.japanese)
+                              : question.question;
+                          ClipboardHelper.copy(context, text, label: 'Question sentence copied');
+                        },
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
+
+              // Centered TTS Speaker Button
+              if (question.japanese.isNotEmpty) ...[
+                Center(
+                  child: Material(
+                    color: isDark ? Colors.white10 : const Color(0xFF06B6D4).withValues(alpha: 0.1),
+                    shape: const CircleBorder(),
+                    child: InkWell(
+                      customBorder: const CircleBorder(),
+                      onTap: () {
                         final text = _isAnswerSubmitted && question.completedSentence.isNotEmpty
                             ? question.completedSentence
                             : question.japanese.replaceAll('___', '');
                         tts.speakJapanese(text);
                       },
+                      child: const Padding(
+                        padding: EdgeInsets.all(10),
+                        child: Icon(Icons.volume_up_rounded, color: Color(0xFF06B6D4), size: 26),
+                      ),
                     ),
-                ],
-              ),
-              const SizedBox(height: 10),
+                  ),
+                ),
+                const SizedBox(height: 10),
+              ],
 
               if (question.japanese.isNotEmpty) ...[
                 GrammarJapaneseSentenceWidget(
@@ -722,6 +1177,9 @@ class _VocabLearnScreenState extends State<VocabLearnScreen> {
             child: InkWell(
               borderRadius: BorderRadius.circular(16),
               onTap: _isAnswerSubmitted ? null : () => _submitAnswer(optKey),
+              onLongPress: () {
+                ClipboardHelper.copy(context, optLabel, label: 'Option "$optLabel" copied');
+              },
               child: Container(
                 padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
                 decoration: BoxDecoration(
@@ -767,9 +1225,17 @@ class _VocabLearnScreenState extends State<VocabLearnScreen> {
                       ),
                     ),
                     if (_isAnswerSubmitted && optKey == question.correctOption)
-                      const Icon(Icons.check_circle_rounded, color: Color(0xFF10B981), size: 22),
-                    if (_isAnswerSubmitted && optKey == _selectedOption && optKey != question.correctOption)
-                      const Icon(Icons.cancel_rounded, color: Color(0xFFEF4444), size: 22),
+                      const Icon(Icons.check_circle_rounded, color: Color(0xFF10B981), size: 22)
+                    else if (_isAnswerSubmitted && optKey == _selectedOption && optKey != question.correctOption)
+                      const Icon(Icons.cancel_rounded, color: Color(0xFFEF4444), size: 22)
+                    else
+                      IconButton(
+                        icon: Icon(Icons.copy_rounded, size: 16, color: isDark ? Colors.white38 : Colors.grey.shade400),
+                        tooltip: 'Copy option',
+                        onPressed: () {
+                          ClipboardHelper.copy(context, optLabel, label: 'Option "$optLabel" copied');
+                        },
+                      ),
                   ],
                 ),
               ),

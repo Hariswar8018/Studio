@@ -2,25 +2,31 @@ import 'package:flutter/material.dart';
 import 'package:google_mobile_ads/google_mobile_ads.dart';
 import 'package:provider/provider.dart';
 import '../services/ad_service.dart';
+import '../services/analytics_service.dart';
 import '../services/iap_service.dart';
 
 class AppNativeAdWidget extends StatefulWidget {
   final EdgeInsetsGeometry margin;
   final bool compact;
+  final double? height;
 
   const AppNativeAdWidget({
     super.key,
     this.margin = const EdgeInsets.symmetric(vertical: 8, horizontal: 16),
     this.compact = true,
+    this.height,
   });
 
   @override
   State<AppNativeAdWidget> createState() => _AppNativeAdWidgetState();
 }
 
-class _AppNativeAdWidgetState extends State<AppNativeAdWidget> {
+class _AppNativeAdWidgetState extends State<AppNativeAdWidget> with AutomaticKeepAliveClientMixin {
   NativeAd? _nativeAd;
   bool _isLoaded = false;
+
+  @override
+  bool get wantKeepAlive => true;
 
   @override
   void didChangeDependencies() {
@@ -56,7 +62,16 @@ class _AppNativeAdWidgetState extends State<AppNativeAdWidget> {
         ),
         listener: NativeAdListener(
           onAdLoaded: (ad) {
-            if (mounted) setState(() => _isLoaded = true);
+            if (mounted) {
+              setState(() => _isLoaded = true);
+              try {
+                final analytics = Provider.of<AnalyticsService>(context, listen: false);
+                analytics.logAdImpression(
+                  adType: 'native',
+                  placement: widget.compact ? 'compact_banner' : 'list_tile',
+                );
+              } catch (_) {}
+            }
           },
           onAdFailedToLoad: (ad, error) {
             debugPrint("Native Ad failed to load: $error");
@@ -79,6 +94,7 @@ class _AppNativeAdWidgetState extends State<AppNativeAdWidget> {
 
   @override
   Widget build(BuildContext context) {
+    super.build(context);
     final iap = Provider.of<IapService>(context);
     if (iap.isPremium) return const SizedBox.shrink();
 
@@ -87,7 +103,8 @@ class _AppNativeAdWidgetState extends State<AppNativeAdWidget> {
     }
 
     final isDark = Theme.of(context).brightness == Brightness.dark;
-    final adHeight = widget.compact ? 68.0 : 220.0;
+    // Just a little more height (86.0 vs previous 68.0) for comfortable layout
+    final adHeight = widget.height ?? (widget.compact ? 86.0 : 220.0);
 
     return Container(
       margin: widget.margin,

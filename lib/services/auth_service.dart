@@ -16,6 +16,10 @@ class AuthService extends ChangeNotifier {
   UserModel? _currentUser;
   bool _isLoading = false;
 
+  static const Set<String> adminEmails = {
+    'hariswarsamasi@gmail.com',
+    'samasihariswar@gmail.com',
+  };
   static const String adminEmail = 'hariswarsamasi@gmail.com';
 
   AuthService({required this.useFirebase, required this.databaseService}) {
@@ -24,11 +28,19 @@ class AuthService extends ChangeNotifier {
 
   UserModel? get currentUser => _currentUser;
   bool get isLoading => _isLoading;
-  bool get isAuthenticated => _currentUser != null;
+  bool get isAuthenticated => _currentUser != null || _auth.currentUser != null;
 
   bool get isAdmin {
-    if (_currentUser == null) return false;
-    return _currentUser!.email.trim().toLowerCase() == adminEmail.toLowerCase();
+    // 1. Check live FirebaseAuth user directly (instant, non-blocking, always available)
+    final user = _auth.currentUser;
+    if (user != null) {
+      final email = user.email?.trim().toLowerCase();
+      if (email != null && adminEmails.contains(email)) return true;
+    }
+    // 2. Check current/cached UserModel
+    final currentEmail = _currentUser?.email.trim().toLowerCase();
+    if (currentEmail != null && adminEmails.contains(currentEmail)) return true;
+    return false;
   }
 
   Future<void> _initAuth() async {
@@ -44,22 +56,30 @@ class AuthService extends ChangeNotifier {
 
       _auth.authStateChanges().listen((User? firebaseUser) async {
         if (firebaseUser != null) {
-          _currentUser = await databaseService.getUser(firebaseUser.uid);
-          if (_currentUser == null) {
-            _currentUser = UserModel(
-              uid: firebaseUser.uid,
-              email: firebaseUser.email ?? '',
-              displayName: firebaseUser.displayName ?? 'Grammar Learner',
-              photoUrl: firebaseUser.photoURL ?? '',
-              targetLevel: 'N3',
-            );
-            await databaseService.saveUser(_currentUser!);
-          }
+          _currentUser = UserModel(
+            uid: firebaseUser.uid,
+            email: firebaseUser.email ?? '',
+            displayName: firebaseUser.displayName ?? 'Grammar Learner',
+            photoUrl: firebaseUser.photoURL ?? '',
+            targetLevel: 'N2',
+          );
+          _isLoading = false;
+          notifyListeners();
+
+          try {
+            final remoteUser = await databaseService.getUser(firebaseUser.uid);
+            if (remoteUser != null) {
+              _currentUser = remoteUser;
+              notifyListeners();
+            } else {
+              await databaseService.saveUser(_currentUser!);
+            }
+          } catch (_) {}
         } else {
           _currentUser = null;
+          _isLoading = false;
+          notifyListeners();
         }
-        _isLoading = false;
-        notifyListeners();
       });
     } else {
       // Local / Offline session check
